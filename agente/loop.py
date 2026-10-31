@@ -31,8 +31,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from agente.accion import Resultado, clic_en_texto, escribir_en_campo, observar, parecidos
-from agente.percepcion import (Linea, buscar_texto, campo_de_etiqueta, detectar_campos, es_destructiva,
+from agente.accion import Resultado, clic_en_texto, elegir_en_combo, escribir_en_campo, observar, parecidos
+from difflib import SequenceMatcher
+
+from agente.percepcion import (Linea, Palabra, buscar_texto, leer_zona, campo_de_etiqueta, detectar_campos, es_destructiva,
                                fecha_hoy, leer_pantalla, normalizar)
 from agente.secretos import filtrar
 
@@ -66,12 +68,16 @@ coordenadas.
 
 Acciones:
 - clic(texto): clic sobre un texto visible (menú, botón, enlace, fila, opción de lista).
-  Copia el texto tal como aparece en la pantalla. Para abrir un desplegable (marcado [desplegable]
-  en CAMPOS) haz clic en su etiqueta; luego clic en la opción que aparezca.
+  Copia el texto tal como aparece en la pantalla.
+- elegir(etiqueta, opcion): elige una opción en un desplegable (marcado [desplegable] en CAMPOS).
+  El código lo abre, busca la opción y confirma que quedó. No uses clic para desplegables.
 - escribir(etiqueta, valor): escribe en la caja de texto cuya etiqueta visible es `etiqueta`
   (borra lo que tenía). `valor` sale de la TAREA, literal (o una fecha calculada desde HOY, en el
   formato que use la app); nunca lo inventes.
 - tecla(nombre): enter, esc, tab, abajo, arriba, avpag, repag, inicio, fin.
+- contar(incluye, excluye): no toca la pantalla. Fija el criterio para contar filas de la tabla:
+  una fila cuenta si contiene TODOS los textos de `incluye` y NINGUNO de `excluye`. El código
+  cuenta la página visible y, desde ahí, cada página nueva que veas, y te da el TOTAL en CUENTAS.
 - terminar(estado, resumen): estado "terminada" o "fallida".
 
 Cómo trabajar:
@@ -93,8 +99,15 @@ Cómo trabajar:
    que la tarea no pida, no guardes, exportes ni confirmes nada de más. Cada cosa una sola vez.
 8. Fechas relativas ("hoy", "ayer", "el mes pasado") se cuentan desde la fecha HOY que te doy
    (la de la app), no desde la fecha real.
-9. Para contar, usa el total que muestra la app si existe; si hay páginas, recórrelas todas y
-   lleva la cuenta en "memoria".
+9. Para contar o sumar: primero pon en la app TODOS los filtros que correspondan (texto y
+   desplegables) y APLÍCALOS con el botón de búsqueda/filtrar; comprueba en la tabla que el
+   filtro se aplicó (p. ej. ya no salen filas con otro estado). Luego usa el total que muestre la
+   app si existe. Si no hay total, NO cuentes tú: con los filtros ya aplicados usa contar una vez
+   (p. ej. incluye ["<nombre exacto>", "<estado>"]; excluye los textos de registros parecidos pero
+   distintos, como un nombre más largo "X e Hijos" frente a "X"). Después solo pasa de página
+   hasta que no haya siguiente o la pantalla no cambie; el código suma. Responde con el TOTAL de
+   CUENTAS. Si cambias filtros, vuelve a usar contar (las cuentas se reinician). Una tabla con botón de página siguiente puede tener
+   más páginas: NO respondas con solo la primera.
 10. Antes de "terminada", la pantalla debe mostrar el resultado (registro guardado con los
    valores, total contado, exportación confirmada).
 11. Si un AVISO DEL CÓDIGO rechaza tu acción, corrígela; no repitas lo mismo.
@@ -110,11 +123,13 @@ Resumen al terminar:
 Responde SOLO un objeto JSON con estas claves:
 {"razon": "qué veo y por qué hago esto (corto)",
  "memoria": "notas que quieres conservar para los siguientes pasos (cuentas parciales, datos vistos) o null",
- "accion": "clic | escribir | tecla | terminar",
- "texto": "(clic)", "etiqueta": "(escribir)", "valor": "(escribir)", "tecla": "(tecla)",
+ "accion": "clic | escribir | elegir | tecla | contar | terminar",
+ "texto": "(clic)", "etiqueta": "(escribir, elegir)", "valor": "(escribir)", "opcion": "(elegir)",
+ "tecla": "(tecla)",
  "estado": "terminada | fallida (terminar)", "resumen": "(terminar)",
  "respuesta": "valor o null (terminar, solo preguntas respondidas)",
- "datos_razon": ["(terminar fallida) datos que explican el fallo"]}"""
+ "datos_razon": ["(terminar fallida) datos que explican el fallo"],
+ "incluye": ["(contar)"], "excluye": ["(contar)"]}"""
 
 PROMPT_CLASIFICAR = """Clasifica una instrucción dada a un agente que opera una aplicación de gestión.
 Responde SOLO JSON: {"tipo": "accion | pregunta | posible_fallo",
@@ -137,7 +152,7 @@ class Paso:
     accion: dict
     resultado: str
     ok: bool
-    pantalla: str = ""        # resumen de la pantalla vista (primeras filas)
+    pantalla: str = ""        # pantalla vista (filas OCR + campos) cuando el LLM decidió
     tokens: int = 0
     costo: float = 0.0
     t_llm: float = 0.0
@@ -156,16 +171,20 @@ class Estado:
     clics_ok: list[str] = field(default_factory=list)
     memoria: str = ""
     aviso: str = ""
-    hechas: set = field(default_factory=set)        # (firma pantalla, acción) ya ejecutadas
+    hechas: dict = field(default_factory=dict)      # (firma pantalla, acción) -> resultado
     fallos_seguidos: int = 0
     textos_vistos: set = field(default_factory=set)  # normalizados, para validar datos_razon
     filas_vistas: list = field(default_factory=list)  # filas de pantalla (texto) vistas en la tarea
     avisos_fallida: int = 0
     avisos_terminada: int = 0
+    aviso_pregunta: bool = False
+    criterio: dict | None = None                     # {"incluye": [...], "excluye": [...]}
+    paginas_contadas: list = field(default_factory=list)  # [(líneas de la página, nº filas que cumplen)]
     tokens: int = 0
     costo: float = 0.0
     inicio: float = field(default_factory=time.time)
     llamadas_llm: int = 0
+    imagen: object = None                            # captura actual (para relecturas)
 
     def restante(self) -> float:
         return self.deadline - time.time()
@@ -241,7 +260,13 @@ def campos_visibles(imagen, lineas: list[Linea]) -> list[str]:
     la izquierda) y el contenido leído dentro. Un campo vacío no lo ve el OCR: así el LLM
     sabe que existe."""
     out = []
-    for k in detectar_campos(imagen):
+    campos = detectar_campos(imagen)[:12]
+    # El contenido se relee recortando SOLO el interior (el OCR de pantalla completa pierde a
+    # veces el texto pegado al borde de la caja). En el desplegable se excluye la flecha.
+    interiores = list(_POOL_RELECTURA.map(
+        lambda k: leer_zona(imagen, (k.x + 2, k.y + 2, k.w - (24 if k.combo else 4), k.h - 4)).replace("|", " ").strip(),
+        campos))
+    for k, leido in zip(campos, interiores):
         dentro = [ln.texto for ln in lineas
                   if k.x <= ln.caja[0] + ln.caja[2] / 2 <= k.x + k.w and k.y <= ln.caja[1] + ln.caja[3] / 2 <= k.y + k.h]
         etiqueta, mejor = None, 1e9
@@ -255,7 +280,7 @@ def campos_visibles(imagen, lineas: list[Linea]) -> list[str]:
                 if d < mejor:
                     etiqueta, mejor = ln.texto, d
         tipo = " [desplegable]" if k.combo else ""
-        valor = " ".join(dentro) if dentro else "(vacío)"
+        valor = " ".join(leido.split()) or (" ".join(dentro) if dentro else "") or "(vacío)"
         out.append(f"- {etiqueta or '(sin etiqueta)'}{tipo}: {valor}")
     return out
 
@@ -272,8 +297,45 @@ def pantalla_para_llm(imagen, lineas: list[Linea]) -> tuple[str, str]:
     return texto, corto[:600]
 
 
+def cambio_real(a: list[Linea], b: list[Linea], umbral: float = 0.85) -> bool:
+    """True si dos lecturas difieren de verdad (no por ruido del OCR): Jaccard de líneas."""
+    sa, sb = {normalizar(l.texto) for l in a}, {normalizar(l.texto) for l in b}
+    return len(sa & sb) / max(len(sa | sb), 1) < umbral
+
+
 def firma(lineas: list[Linea]) -> str:
     return hashlib.md5("\n".join(normalizar(l.texto) for l in lineas).encode()).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------- contar filas (lo hace el código)
+def filas_de_tabla(imagen, lineas: list[Linea]) -> list[str]:
+    """Filas visuales que no son parte de un formulario: se descartan las que tienen texto
+    dentro de una caja de texto/desplegable (la fila de filtros repite los mismos textos)."""
+    cajas = [k.caja for k in detectar_campos(imagen)]
+    dentro = lambda l: any(x <= l.caja[0] + l.caja[2] / 2 <= x + w and y <= l.caja[1] + l.caja[3] / 2 <= y + h
+                           for x, y, w, h in cajas)
+    return [" | ".join(l.texto for l in f) for f in filas(lineas) if not any(dentro(l) for l in f)]
+
+
+def cumple(fila: str, criterio: dict) -> bool:
+    nf = normalizar(fila.replace("|", " "))
+    return (all(normalizar(t) in nf for t in criterio["incluye"]) and
+            not any(normalizar(t) in nf for t in criterio["excluye"]))
+
+
+def contar_pagina(est, imagen, lineas: list[Linea]) -> None:
+    """Cuenta en la pantalla actual las filas que cumplen el criterio. Si esta página ya se
+    contó (mismas filas, salvo ruido del OCR), se reemplaza su cuenta; si es nueva, se suma."""
+    if not est.criterio:
+        return
+    tabla = filas_de_tabla(imagen, lineas)
+    n = sum(cumple(f, est.criterio) for f in tabla)
+    actual = {normalizar(f) for f in tabla}
+    for i, (prev, _) in enumerate(est.paginas_contadas):
+        if len(actual & prev) / max(len(actual | prev), 1) >= 0.6:
+            est.paginas_contadas[i] = (actual, n)
+            return
+    est.paginas_contadas.append((actual, n))
 
 
 # ---------------------------------------------------------------- validación de valores
@@ -325,6 +387,88 @@ def valor_permitido(valor: str, tarea: str, hoy: date | None, lineas: list[Linea
                    "opción visible. No inventes valores: usa los de la tarea")
 
 
+# ---------------------------------------------------------------- relectura
+from concurrent.futures import ThreadPoolExecutor
+
+_POOL_RELECTURA = ThreadPoolExecutor(max_workers=4, thread_name_prefix="relectura")
+CONF_RELEER = 40            # líneas con confianza OCR menor se releen solas
+MAX_RELEER = 6
+
+
+def _linea_desde_texto(texto: str, caja: tuple[int, int, int, int]) -> Linea:
+    """Linea con una Palabra por palabra de `texto`, repartidas en `caja` según la posición
+    de cada palabra en el texto (para que clic en una palabra caiga sobre ella)."""
+    x, y, w, h = caja
+    n = max(len(texto), 1)
+    palabras, i = [], 0
+    for t in texto.split():
+        k = texto.find(t, i)
+        i = k + len(t)
+        px = x + int(w * k / n)
+        palabras.append(Palabra(t, px, y, max(4, int(w * len(t) / n)), h, 60.0))
+    return Linea(palabras)
+
+
+def mejorar_lineas(imagen, lineas: list[Linea]) -> list[Linea]:
+    """Relee (psm 7, x2, recorte con margen) las líneas de confianza baja. Visto: el ítem de un
+    menú desplegable con borde "Facturas" leído '"tures' (confianza 0); 'cL-0110' -> 'CL-0110'.
+    Se reemplaza solo si la relectura trae al menos tantos caracteres útiles."""
+    dudosas = sorted((i for i, ln in enumerate(lineas) if ln.confianza < CONF_RELEER),
+                     key=lambda i: lineas[i].confianza)[:MAX_RELEER]
+    if not dudosas:
+        return lineas
+    alto, ancho = imagen.shape[:2]
+
+    def zona(i):
+        x, y, w, h = lineas[i].caja
+        m = 8
+        x0, y0 = max(0, x - m - 4), max(0, y - m // 2 - 3)
+        return x0, y0, min(ancho, x + w + m + 4) - x0, min(alto, y + h + m // 2 + 3) - y0
+
+    leidos = list(_POOL_RELECTURA.map(lambda i: leer_zona(imagen, zona(i)).replace("|", " ").strip(), dudosas))
+    nuevas = list(lineas)
+    util = lambda t: sum(c.isalnum() for c in t)
+    for i, t in zip(dudosas, leidos):
+        t = " ".join(t.split())
+        if util(t) >= 2 and util(t) >= util(lineas[i].texto.replace("|", "")) - 1:
+            nuevas[i] = _linea_desde_texto(t, lineas[i].caja)
+    return nuevas
+
+
+def releer_para(imagen, lineas: list[Linea], objetivo: str, maximo: int = 5) -> bool:
+    """Segunda oportunidad del OCR: si `objetivo` no está en las líneas, se releen (psm 7, x2)
+    las zonas de las líneas más parecidas, ampliadas. Visto: un menú desplegable con borde
+    "Facturas" -> '"tures'. Si la relectura lo contiene, se REEMPLAZA esa línea en `lineas`
+    (con la caja del texto estimada) y devuelve True. No inventa: solo lo que el OCR relee."""
+    obj = normalizar(objetivo)
+    if not obj:
+        return False
+    alto, ancho = imagen.shape[:2]
+    puntuadas = sorted(((max(SequenceMatcher(None, obj, normalizar(p.texto)).ratio() for p in ln.palabras), i)
+                        for i, ln in enumerate(lineas)), reverse=True)
+    for r, i in puntuadas[:maximo]:
+        if r < 0.35:
+            break
+        x, y, w, h = lineas[i].caja
+        mw, mh = int(max(w, 30) * 1.5), int(h * 0.8) + 2
+        x0, y0 = max(0, x - mw), max(0, y - mh)
+        x1, y1 = min(ancho, x + w + mw), min(alto, y + h + mh)
+        leido = leer_zona(imagen, (x0, y0, x1 - x0, y1 - y0)).replace("|", " ").strip()
+        nl = normalizar(leido)
+        k = nl.find(obj)
+        if not leido or k < 0:
+            continue
+        # Caja del objetivo: proporcional a su posición en el texto releído.
+        frac0, frac1 = k / max(len(nl), 1), (k + len(obj)) / max(len(nl), 1)
+        px0 = x0 + int((x1 - x0) * frac0)
+        pw = max(8, int((x1 - x0) * (frac1 - frac0)))
+        nueva = Linea([Palabra(t, px0 if j == 0 else px0 + pw, y, pw if j == 0 else 1, h, 50.0)
+                       for j, t in enumerate([objetivo])])
+        lineas[i] = nueva
+        return True
+    return False
+
+
 # ---------------------------------------------------------------- ejecutar una acción
 def _combo_de_etiqueta(imagen, lineas, texto):
     """Si `texto` es la etiqueta de UN desplegable, devuelve la caja del desplegable."""
@@ -357,6 +501,8 @@ def ejecutar(vnc, accion: dict, imagen, lineas) -> Resultado:
         return clic_en_texto(vnc, accion["texto"], imagen, lineas)
     if tipo == "escribir":
         return escribir_en_campo(vnc, accion["etiqueta"], accion["valor"], imagen, lineas)
+    if tipo == "elegir":
+        return elegir_en_combo(vnc, accion["etiqueta"], accion["opcion"], imagen, lineas)
     if tipo == "tecla":
         teclas = TECLAS_LLM[normalizar(accion["tecla"]).replace(" ", "")]
         t0 = time.perf_counter()
@@ -371,8 +517,15 @@ def ejecutar(vnc, accion: dict, imagen, lineas) -> Resultado:
 def validar(accion: dict, est: Estado, lineas: list[Linea], hoy: date | None, fp: str) -> str:
     """'' si la acción es válida; si no, el aviso para el LLM. No toca la pantalla."""
     tipo = accion.get("accion")
-    if tipo not in ("clic", "escribir", "tecla", "terminar"):
-        return f"Acción '{tipo}' no existe. Usa clic, escribir, tecla o terminar."
+    if tipo == "contar":
+        inc = [str(t).strip() for t in (accion.get("incluye") or []) if str(t).strip()]
+        exc = [str(t).strip() for t in (accion.get("excluye") or []) if str(t).strip()]
+        if not inc:
+            return "contar necesita 'incluye' (textos que debe tener cada fila que cuenta)."
+        accion["incluye"], accion["excluye"] = inc, exc
+        return ""
+    if tipo not in ("clic", "escribir", "elegir", "tecla", "terminar"):
+        return f"Acción '{tipo}' no existe. Usa clic, escribir, elegir, tecla o terminar."
     if tipo == "clic":
         texto = str(accion.get("texto") or "").strip()
         if not texto:
@@ -380,7 +533,7 @@ def validar(accion: dict, est: Estado, lineas: list[Linea], hoy: date | None, fp
         accion["texto"] = texto
         if es_destructiva(texto) and not es_destructiva(est.tarea):
             return f"'{texto}' es un control destructivo y la tarea no pide eso. No lo uses."
-        if not buscar_texto(lineas, texto):
+        if not buscar_texto(lineas, texto) and not (est.imagen is not None and releer_para(est.imagen, lineas, texto)):
             return (f"'{texto}' no está en la pantalla. Parecidos visibles: {parecidos(lineas, texto)}. "
                     "Copia un texto de PANTALLA tal cual.")
     elif tipo == "escribir":
@@ -388,21 +541,31 @@ def validar(accion: dict, est: Estado, lineas: list[Linea], hoy: date | None, fp
         if not etq or val is None:
             return "escribir necesita 'etiqueta' y 'valor'."
         accion["etiqueta"], accion["valor"] = etq, str(val)
-        if not buscar_texto(lineas, etq):
+        if not buscar_texto(lineas, etq) and not (est.imagen is not None and releer_para(est.imagen, lineas, etq)):
             return f"La etiqueta '{etq}' no está en la pantalla. Parecidos: {parecidos(lineas, etq)}."
         ok, motivo = valor_permitido(accion["valor"], est.tarea, hoy, lineas)
         if not ok:
             return f"Valor '{accion['valor']}' rechazado: {motivo}."
+    elif tipo == "elegir":
+        etq, op = str(accion.get("etiqueta") or "").strip(), str(accion.get("opcion") or accion.get("valor") or "").strip()
+        if not etq or not op:
+            return "elegir necesita 'etiqueta' y 'opcion'."
+        accion["etiqueta"], accion["opcion"] = etq, op
+        if not buscar_texto(lineas, etq):
+            return f"La etiqueta '{etq}' no está en la pantalla. Parecidos: {parecidos(lineas, etq)}."
+        ok, motivo = valor_permitido(op, est.tarea, hoy, lineas)
+        if not ok:
+            return f"Opción '{op}' rechazada: {motivo}."
     elif tipo == "tecla":
         nombre = normalizar(str(accion.get("tecla") or "")).replace(" ", "")
         if nombre not in TECLAS_LLM:
             return f"Tecla '{accion.get('tecla')}' no soportada. Usa: {sorted(set(TECLAS_LLM))}."
     if tipo != "terminar":
-        clave = (fp, json.dumps({k: accion.get(k) for k in ("accion", "texto", "etiqueta", "valor", "tecla")},
+        clave = (fp, json.dumps({k: accion.get(k) for k in ("accion", "texto", "etiqueta", "valor", "opcion", "tecla")},
                                 sort_keys=True, ensure_ascii=False))
         if clave in est.hechas:
-            return ("Ya hiciste exactamente esa acción en esta misma pantalla y no avanzó. "
-                    "Haz otra cosa (otro control, otra ruta) o termina.")
+            return (f"Ya hiciste exactamente esa acción en esta misma pantalla (resultado: {est.hechas[clave][:200]}). "
+                    "No la repitas: haz otra cosa (otra acción, otro control, otra ruta) o termina.")
     return ""
 
 
@@ -478,10 +641,14 @@ def mensaje_paso(est: Estado, pantalla: str, pasos_restantes: int | None) -> str
         partes.append("CLICS QUE FUNCIONARON (en orden): " + " > ".join(est.clics_ok[-12:]))
     if est.memoria:
         partes.append(f"MEMORIA: {est.memoria}")
+    if est.criterio:
+        partes.append(f"CUENTAS (criterio {json.dumps(est.criterio, ensure_ascii=False)}): "
+                      + "; ".join(f"pág {i + 1}: {c}" for i, (_, c) in enumerate(est.paginas_contadas))
+                      + f" -> TOTAL {sum(c for _, c in est.paginas_contadas)} en {len(est.paginas_contadas)} página(s)")
     if est.pasos:
         hist = []
         for p in est.pasos[-HISTORIAL_VISIBLE:]:
-            a = {k: v for k, v in p.accion.items() if k in ("accion", "texto", "etiqueta", "valor", "tecla") and v}
+            a = {k: v for k, v in p.accion.items() if k in ("accion", "texto", "etiqueta", "valor", "opcion", "tecla") and v}
             hist.append(f"  {p.n}. {json.dumps(a, ensure_ascii=False)} -> {'ok' if p.ok else 'ERROR'}: {p.resultado[:300]}")
         partes.append("ÚLTIMOS PASOS:\n" + "\n".join(hist))
     if pasos_restantes is not None:
@@ -539,7 +706,10 @@ def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Es
             hechos = "; ".join(f"{p.accion.get('accion')} {p.accion.get('texto') or p.accion.get('etiqueta') or ''}".strip()
                                for p in est.pasos if p.ok)[-400:]
             return cerrar("fallida", f"Se acabó el tiempo antes de completar la tarea. Pasos hechos: {hechos or 'ninguno'}.")
+        lineas = mejorar_lineas(imagen, lineas)
         fp = firma(lineas)
+        est.imagen = imagen
+        contar_pagina(est, imagen, lineas)          # solo si hay criterio de conteo
         for ln in lineas:
             est.textos_vistos.add(normalizar(ln.texto))
         for f in filas(lineas):
@@ -547,6 +717,7 @@ def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Es
             if t not in est.filas_vistas:
                 est.filas_vistas.append(t)
         pantalla, corto = pantalla_para_llm(imagen, lineas)
+        corto = pantalla
 
         # Presupuesto: tiempo medio por paso (o estimación inicial) frente a lo que queda.
         medio = (sum(p.t_total for p in est.pasos) / len(est.pasos)) if est.pasos else PASO_ESTIMADO_INICIAL
@@ -570,7 +741,7 @@ def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Es
             continue
         if obj.get("memoria") not in (None, "", "null"):
             est.memoria = str(obj["memoria"])[:800]
-        accion = {k: obj.get(k) for k in ("accion", "texto", "etiqueta", "valor", "tecla", "estado",
+        accion = {k: obj.get(k) for k in ("accion", "texto", "etiqueta", "valor", "opcion", "tecla", "incluye", "excluye", "estado",
                                           "resumen", "respuesta", "datos_razon", "razon")}
         accion["accion"] = normalizar(str(accion.get("accion") or ""))
 
@@ -581,11 +752,18 @@ def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Es
                 aviso = "terminar necesita estado 'terminada' o 'fallida'."
             elif estado == "fallida":
                 aviso = validar_fallida(accion, est)
+            elif tipo_tarea == "pregunta" and not est.aviso_pregunta:
+                # Una pregunta se responde con TODO el conjunto, no con lo visible: 1 repaso.
+                est.aviso_pregunta = True
+                aviso = ("Antes de responder, revisa: (1) ¿aplicaste todos los filtros y la tabla los "
+                         "refleja? (2) ¿la tabla tiene más páginas o más filas fuera de la vista? Si hay "
+                         "un control de página siguiente que no has usado, recorre TODAS las páginas y "
+                         "suma (anota cada página en memoria). Si ya está todo, vuelve a terminar.")
             else:
                 # ...y se RELEE antes de terminar, junto con la pantalla.
                 imagen2, lineas2, _ = observar(vnc)
                 hoy2 = fecha_hoy(lineas2)
-                if est.avisos_terminada < 1 and ((hoy2 and hoy2 != est.hoy) or firma(lineas2) != fp):
+                if est.avisos_terminada < 1 and ((hoy2 and hoy2 != est.hoy) or cambio_real(lineas, lineas2)):
                     est.avisos_terminada += 1
                     if hoy2:
                         est.hoy = hoy2
@@ -604,7 +782,25 @@ def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Es
                                   t_llm, 0, time.time() - t_paso))
             est.fallos_seguidos += 1
             if est.fallos_seguidos >= 3:
-                est.aviso += " Llevas varios errores seguidos: replantea el camino."
+                # Atascado en rechazos: Esc, observar de nuevo y obligar a replantear.
+                vnc.pulsar("esc")
+                imagen, lineas, _ = observar(vnc)
+                est.fallos_seguidos = 0
+                est.aviso += (" Llevas 3 acciones rechazadas seguidas: pulsé Esc y releí la pantalla. "
+                              "Cambia de estrategia (otro menú, otro control).")
+            est.pasos[-1].t_total = time.time() - t_paso
+            guardar_traza(est)
+            continue
+
+        if accion["accion"] == "contar":
+            est.criterio = {"incluye": accion["incluye"], "excluye": accion["excluye"]}
+            est.paginas_contadas = []
+            contar_pagina(est, imagen, lineas)
+            total = sum(c for _, c in est.paginas_contadas)
+            detalle = f"criterio fijado; esta página: {est.paginas_contadas[-1][1]} filas cumplen"
+            est.pasos.append(Paso(n, accion, f"{detalle}. TOTAL {total}", True, corto, tok, cos, t_llm, 0,
+                                  time.time() - t_paso))
+            est.fallos_seguidos = 0
             guardar_traza(est)
             continue
 
@@ -614,9 +810,12 @@ def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Es
         except Exception as e:
             res = Resultado(False, f"excepción al ejecutar: {type(e).__name__}: {e}")
         t_acc = time.time() - t1
-        est.hechas.add((fp, json.dumps({k: accion.get(k) for k in ("accion", "texto", "etiqueta", "valor", "tecla")},
-                                       sort_keys=True, ensure_ascii=False)))
+        est.hechas[(fp, json.dumps({k: accion.get(k) for k in ("accion", "texto", "etiqueta", "valor", "opcion", "tecla")},
+                                   sort_keys=True, ensure_ascii=False))] = res.detalle
         est.pasos.append(Paso(n, accion, res.detalle, res.ok, corto, tok, cos, t_llm, t_acc, 0))
+        if res.ok and accion["accion"] in ("escribir", "elegir") and est.criterio:
+            est.criterio, est.paginas_contadas = None, []
+            est.aviso = "Cambiaste un filtro: las CUENTAS se reiniciaron. Aplica el filtro y vuelve a usar contar."
         if res.ok:
             est.fallos_seguidos = 0
             if accion["accion"] == "clic":

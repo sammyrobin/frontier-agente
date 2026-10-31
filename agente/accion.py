@@ -249,3 +249,75 @@ def escribir_en_campo(vnc, etiqueta: str, texto: str, imagen: np.ndarray | None 
         return Resultado(True, base + " (coincide salvo tildes/mayúsculas: límite del OCR)" + nota,
                          despues, None, [c], True, tiempos)
     return Resultado(False, base + ": NO coincide" + nota, despues, None, [c], True, tiempos)
+
+
+# ---------------- elegir en un desplegable (combo) ----------------
+def _combo_de(imagen: np.ndarray, lineas: list[Linea], etiqueta: str):
+    """(campo combo, candidato de la etiqueta, detalle). Exige UN solo combo para la etiqueta."""
+    etiquetas = buscar_texto(lineas, etiqueta)
+    if not etiquetas:
+        return None, None, f"No encontré la etiqueta '{etiqueta}'. Parecidos visibles: {parecidos(lineas, etiqueta)}"
+    combos = [k for k in detectar_campos(imagen) if k.combo]
+    hallados = []
+    for c in etiquetas:
+        campo, _ = campo_de_etiqueta(combos, (c.x, c.y, c.w, c.h))
+        if campo is not None and all(campo is not h for h, _ in hallados):
+            hallados.append((campo, c))
+    if not hallados:
+        return None, None, f"La etiqueta '{etiqueta}' no tiene un desplegable al lado o debajo"
+    if len(hallados) > 1:
+        return None, None, f"La etiqueta '{etiqueta}' es ambigua: {len(hallados)} desplegables"
+    return hallados[0][0], hallados[0][1], ""
+
+
+def elegir_en_combo(vnc, etiqueta: str, opcion: str, imagen: np.ndarray | None = None,
+                    lineas: list[Linea] | None = None) -> Resultado:
+    """Abre el desplegable de `etiqueta` y elige `opcion` POR TEXTO:
+      1. clic en la caja -> OCR de la lista abierta;
+      2. la opción es una aparición de `opcion` que NO estaba antes de abrir (descarta filas
+         de tabla con el mismo texto) y, entre esas, la más cercana a la caja;
+      3. respaldo si la lista no se lee: teclear la opción + Enter (selects nativos);
+      4. se RELEE la caja: tiene que mostrar la opción. Si no, error."""
+    tiempos: dict[str, float] = {}
+    if imagen is None or lineas is None:
+        imagen, lineas, tiempos = observar(vnc)
+    combo, etq, error = _combo_de(imagen, lineas, etiqueta)
+    if combo is None:
+        return Resultado(False, error, imagen, lineas, tiempos=tiempos)
+
+    def leer_caja(img):
+        return _limpiar_lectura(leer_zona(img, (combo.x + 2, combo.y + 2, combo.w - 24, combo.h - 4)))
+
+    previo = leer_caja(imagen)
+    if normalizar(previo) == normalizar(opcion):
+        return Resultado(True, f"El desplegable '{etiqueta}' ya muestra '{previo}'", imagen, lineas,
+                         cambio=False, tiempos=tiempos)
+    antes = buscar_texto(lineas, opcion)
+    t0 = time.perf_counter()
+    vnc.clic(*combo.centro)
+    apartar_mouse(vnc, imagen)
+    abierto, cambio = esperar_cambio(vnc, imagen, 2.0)
+    lin_abierto = leer_pantalla(abierto)
+    tiempos["abrir"] = time.perf_counter() - t0
+    nuevas = [c for c in buscar_texto(lin_abierto, opcion)
+              if not any(abs(c.x - a.x) <= 4 and abs(c.y - a.y) <= 4 for a in antes)]
+    cx, cy = combo.centro
+    nuevas.sort(key=lambda c: (abs(c.centro[0] - cx) / 2 + abs(c.centro[1] - cy)))
+    t0 = time.perf_counter()
+    como = ""
+    if nuevas:
+        vnc.clic(*nuevas[0].centro)
+        como = f"clic en la opción '{nuevas[0].texto}' @{nuevas[0].centro} de la lista"
+    else:
+        vnc.escribir(opcion)
+        vnc.pulsar("enter")
+        como = "la lista no se leyó: tecleé la opción + Enter"
+    apartar_mouse(vnc, imagen)
+    despues, _ = vnc.esperar_estable(maximo=2.0)
+    tiempos["elegir"] = time.perf_counter() - t0
+    leido = leer_caja(despues)
+    base = f"Desplegable '{etiqueta}' {combo.caja}: {como}; la caja muestra {leido!r}"
+    if normalizar(opcion) in normalizar(leido) or (normalizar(leido) and normalizar(leido) in normalizar(opcion)):
+        return Resultado(True, base, despues, leer_pantalla(despues), [etq], True, tiempos)
+    vnc.pulsar("esc")
+    return Resultado(False, base + f": NO coincide con '{opcion}' (pulsé Esc)", despues, None, [etq], True, tiempos)
