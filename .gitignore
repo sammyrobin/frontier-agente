@@ -21,3 +21,6 @@ __pycache__/
 .env*
 !.env.example
 tessdata/
+
+# Ajustes locales de Claude Code (no compartir)
+.claude/settings.local.json
