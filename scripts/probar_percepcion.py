@@ -15,7 +15,7 @@ sys.path.insert(0, str(RAIZ))
 import numpy as np
 from PIL import Image
 
-from agente.percepcion import (ESCALA, PSM, Linea, Palabra, agrupar_lineas, buscar_texto,
+from agente.percepcion import (ESCALA, ESCALA_OSCURAS, PSM, Linea, Palabra, agrupar_lineas, buscar_texto,
                                fecha_hoy, leer_pantalla, verificar_tesseract)
 
 fallas = 0
@@ -44,7 +44,7 @@ def main():
     ruta = Path(sys.argv[1]) if len(sys.argv) > 1 else RAIZ / "capturas" / "captura.png"
     imagen = np.array(Image.open(ruta).convert("RGB"))
 
-    print(f"\n1. Captura real ({ruta.name}) con psm {PSM} x{ESCALA}")
+    print(f"\n1. Captura real ({ruta.name}) con psm {PSM}, cuerpo x{ESCALA}, zonas oscuras x{ESCALA_OSCURAS}")
     tiempos = []
     for _ in range(3):
         t = time.perf_counter()
@@ -55,6 +55,23 @@ def main():
     caso("fecha_hoy", fecha_hoy(lineas), date(2026, 10, 14))
     for clave in ["Archivo", "Comercial", "Cartera", "Herramientas", "Ayuda", "Bienvenido a SIGECOM"]:
         caso(f"encuentra '{clave}'", bool(buscar_texto(lineas, clave)), True)
+
+    clientes = RAIZ / "capturas" / "clientes.png"   # la genera scripts/probar_navegacion.py
+    if clientes.exists():
+        print(f"\n1b. Captura real ({clientes.name}): texto claro sobre color y botones con borde")
+        img_c = np.array(Image.open(clientes).convert("RGB"))
+        tiempos = []
+        for _ in range(3):
+            t = time.perf_counter()
+            lineas_c = leer_pantalla(img_c)
+            tiempos.append(time.perf_counter() - t)
+        print(f"  OCR por captura: mediana {statistics.median(tiempos):.2f} s "
+              f"(min {min(tiempos):.2f}, max {max(tiempos):.2f})")
+        caso("fecha_hoy", fecha_hoy(lineas_c), date(2026, 10, 14))
+        for clave in ["Buscar", "Siguiente", "Limpiar", "Nuevo cliente", "Exportar", "Nombre"]:
+            caso(f"encuentra '{clave}'", bool(buscar_texto(lineas_c, clave)), True)
+    else:
+        print(f"\n1b. (omitido: falta {clientes.name}; correr probar_navegacion.py)")
 
     print("\n2. Búsqueda (sintética)")
     ls = agrupar_lineas(linea_sintetica("CL-0007", "Distribuciones", "El", "Faro", "Calle", "45")

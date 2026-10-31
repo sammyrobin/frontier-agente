@@ -20,7 +20,8 @@ from difflib import SequenceMatcher
 
 import numpy as np
 
-from agente.percepcion import Candidato, Linea, buscar_texto, leer_pantalla, normalizar
+from agente.percepcion import (Candidato, Linea, buscar_texto, campo_de_etiqueta, detectar_campos,
+                               leer_pantalla, leer_zona, normalizar)
 
 # Fracción de píxeles distintos para decir "la pantalla cambió". El cursor
 # parpadeante de un campo cambia ~0.01 %; un menú desplegado, varios %.
@@ -105,6 +106,23 @@ def parecidos(lineas: list[Linea], objetivo: str, n: int = 5) -> list[str]:
     return [t for r, t in puntuados[:n] if r >= 0.4]
 
 
+def _se_solapan(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return (min(a[0] + a[2], b[0] + b[2]) > max(a[0], b[0]) and
+            min(a[1] + a[3], b[1] + b[3]) > max(a[1], b[1]))
+
+
+def desempatar(candidatas: list[Candidato], texto: str) -> tuple[list[Candidato], str]:
+    """Desempate determinista: un control (menú, botón, etiqueta de campo) está solo
+    en su línea; el mismo texto dentro de una oración o encabezado es prosa.
+    Solo decide si exactamente UNA candidata es línea completa; si no, las devuelve
+    todas y quien llama reporta la ambigüedad (homónimos, E5)."""
+    if len(candidatas) > 1:
+        solas = [c for c in candidatas if normalizar(c.linea) == normalizar(texto)]
+        if len(solas) == 1:
+            return solas, f" [desempate: única etiqueta sola en su línea entre {len(candidatas)} candidatas]"
+    return candidatas, ""
+
+
 def clic_en_texto(vnc, texto: str, imagen: np.ndarray | None = None,
                   lineas: list[Linea] | None = None, maximo: float = 2.5) -> Resultado:
     """OCR -> buscar_texto -> clic en el centro de la FRASE -> esperar cambio.
@@ -117,15 +135,7 @@ def clic_en_texto(vnc, texto: str, imagen: np.ndarray | None = None,
     if not candidatas:
         return Resultado(False, f"No encontré '{texto}'. Parecidos visibles: {parecidos(lineas, texto)}",
                          imagen, lineas, tiempos=tiempos)
-    nota = ""
-    if len(candidatas) > 1:
-        # Desempate determinista: un control (menú, botón, pestaña) es una etiqueta
-        # sola en su línea; el mismo texto dentro de una oración es prosa, no se clica.
-        # Solo si exactamente UNA candidata es línea completa; homónimos -> error.
-        solas = [c for c in candidatas if normalizar(c.linea) == normalizar(texto)]
-        if len(solas) == 1:
-            nota = f" [desempate: única etiqueta sola en su línea entre {len(candidatas)} candidatas]"
-            candidatas = solas
+    candidatas, nota = desempatar(candidatas, texto)
     if len(candidatas) > 1:
         lista = [f"'{c.texto}' @{c.centro} en '{c.linea}'" for c in candidatas]
         return Resultado(False, f"'{texto}' es ambiguo ({len(candidatas)} candidatas): {lista}",
@@ -159,8 +169,12 @@ def clic_en_texto(vnc, texto: str, imagen: np.ndarray | None = None,
             vnc.mover(*c.centro)
             hover, _ = vnc.esperar_estable(maximo=2.0)
             lineas_h = leer_pantalla(hover)
+            # No cuenta como nuevo: el propio elemento (su lectura cambia al resaltarse:
+            # visto "Maestros" -> "Maemtros"), ni símbolos sueltos como ">".
             nuevos = [ln.texto for ln in lineas_h if normalizar(ln.texto) not in textos_antes
-                      and normalizar(ln.texto) != normalizar(c.linea)]
+                      and normalizar(ln.texto) != normalizar(c.linea)
+                      and not _se_solapan(ln.caja, (c.x, c.y, c.w, c.h))
+                      and sum(ch.isalnum() for ch in ln.texto) >= 2]
             tiempos["hover"] = time.perf_counter() - t3
             if nuevos:
                 return Resultado(True, f"'{c.texto}' @{c.centro} abre contenido con el puntero encima "
@@ -168,3 +182,70 @@ def clic_en_texto(vnc, texto: str, imagen: np.ndarray | None = None,
                                  hover, lineas_h, [c], True, tiempos)
     return Resultado(False, f"Clic en '{c.texto}' @{c.centro} sin cambio de pantalla tras 2 intentos",
                      despues, None, [c], False, tiempos)
+
+
+# ---------------- escribir en un campo ----------------
+def _limpiar_lectura(s: str) -> str:
+    """Quita el cursor de texto ('|') que el OCR a veces lee al final del campo."""
+    return s.replace("|", " ").strip()
+
+
+def escribir_en_campo(vnc, etiqueta: str, texto: str, imagen: np.ndarray | None = None,
+                      lineas: list[Linea] | None = None) -> Resultado:
+    """Ubica la caja de texto por su ETIQUETA (encima o a la izquierda; gana la más
+    cercana), hace clic, Ctrl+A, escribe y RELEE solo esa caja con OCR.
+      - `texto` viene siempre del argumento (la tarea), nunca del OCR.
+      - Sin caja detectada -> error claro; no se adivina.
+      - Combo -> error: no se escribe en un desplegable (operar_combo, pendiente).
+      - Releído distinto -> error (la app concatena si no se seleccionó todo)."""
+    tiempos: dict[str, float] = {}
+    if imagen is None or lineas is None:
+        imagen, lineas, tiempos = observar(vnc)
+
+    t0 = time.perf_counter()
+    etiquetas = buscar_texto(lineas, etiqueta)
+    if not etiquetas:
+        return Resultado(False, f"No encontré la etiqueta '{etiqueta}'. Parecidos visibles: "
+                         f"{parecidos(lineas, etiqueta)}", imagen, lineas, tiempos=tiempos)
+    campos = detectar_campos(imagen)
+    con_caja = []
+    motivos = []
+    for c in etiquetas:
+        campo, porque = campo_de_etiqueta(campos, (c.x, c.y, c.w, c.h))
+        motivos.append(f"'{c.linea}' @{c.centro}: {porque}")
+        if campo:
+            con_caja.append((c, campo))
+    tiempos["ubicar_campo"] = time.perf_counter() - t0
+    if not con_caja:
+        return Resultado(False, f"Etiqueta '{etiqueta}' sin caja de texto detectada: {motivos}. "
+                         f"No escribo a ciegas.", imagen, lineas, etiquetas, tiempos=tiempos)
+    elegidas, nota = desempatar([c for c, _ in con_caja], etiqueta)
+    if len(elegidas) > 1:
+        lista = [f"'{c.linea}' @{c.centro} -> caja {k.caja}" for c, k in con_caja]
+        return Resultado(False, f"Etiqueta '{etiqueta}' ambigua ({len(lista)} con caja): {lista}",
+                         imagen, lineas, elegidas, tiempos=tiempos)
+    c, campo = next((c, k) for c, k in con_caja if c is elegidas[0])
+    if campo.combo:
+        return Resultado(False, f"La caja de '{etiqueta}' {campo.caja} es un desplegable (combo): "
+                         f"no se escribe en ella", imagen, lineas, [c], tiempos=tiempos)
+
+    t0 = time.perf_counter()
+    vnc.clic(*campo.centro)
+    vnc.pulsar("ctrl", "a")      # la app concatena: seleccionar todo antes de escribir
+    vnc.escribir(texto)
+    apartar_mouse(vnc, imagen)   # el puntero (I) taparía el texto al releer
+    despues, _ = vnc.esperar_estable(maximo=2.0)
+    tiempos["escribir"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    leido = _limpiar_lectura(leer_zona(despues, campo.interior))
+    tiempos["releer"] = time.perf_counter() - t0
+
+    base = f"Campo '{etiqueta}' caja {campo.caja}: escrito {texto!r}, releído {leido!r}"
+    if leido == texto:
+        return Resultado(True, base + nota, despues, None, [c], True, tiempos)
+    if normalizar(leido) == normalizar(texto):
+        # El OCR pierde tildes a veces (visto: Rodríguez -> Rodriguez). Lo escrito es el
+        # argumento exacto; se avisa para que la verificación final lo confirme.
+        return Resultado(True, base + " (coincide salvo tildes/mayúsculas: límite del OCR)" + nota,
+                         despues, None, [c], True, tiempos)
+    return Resultado(False, base + ": NO coincide" + nota, despues, None, [c], True, tiempos)

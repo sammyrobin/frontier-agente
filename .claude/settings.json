@@ -1,5 +1,11 @@
 {
   "permissions": {
-    "deny": ["Read(./.env)", "Read(./.env.*)", "Read(./**/.env)"]
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/.env)",
+      "Bash(*.env*)",
+      "PowerShell(*.env*)"
+    ]
   }
 }

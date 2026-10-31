@@ -23,9 +23,14 @@ Reto: docs/reto.md · Pruebas de práctica: pruebas/ · Diseño: docs/doc-diseno
 - [x] scripts/reset.py: POST /__reset con Bearer (HTTP 200 {"ok":true})
 - [x] accion.py: apartar_mouse, esperar_cambio, clic_en_texto (Resultado estructurado)
 - [x] Probar: navegar a Clientes desde un script (scripts/probar_navegacion.py: Comercial > Maestros > Clientes OK)
-- [ ] escribir_en_campo: esperando OK del usuario sobre cómo ubicar un campo vacío
-- [ ] OCR no lee texto blanco sobre botón azul ("Buscar") ni "Siguiente"; pierde tildes a veces
-- [ ] OCR x2 de la tabla de Clientes tarda 5.6 s (> 3 s): reducir
+- [x] Deny de Bash/PowerShell para .env en .claude/settings.json (activo al reiniciar la sesión; probar con prueba_deny/.env); .env.example viaja (excepción al final de .gitignore, verificado con git ls-files)
+- [x] OCR en dos pasadas: lee "Buscar" (blanco sobre azul) y "Siguiente"/"Nuevo cliente" (botones con borde). probar_percepcion.py: 25/25 OK
+- [x] Velocidad idea 1 (cuerpo x1, zonas oscuras x2): medida, NO acelera (ver tabla); se queda por exactitud
+- [x] escribir_en_campo (opción A) + scripts/probar_busqueda.py: Nombre="Ramírez" → Buscar → 9 filas, todas Ramírez
+- [ ] Combo (Ciudad): diseño en respuesta.md, sin implementar
+- [ ] OCR de la tabla: códigos CL subrayados mal leídos ("1-095", "10032", "cL-0046") y tildes perdidas en algunas celdas
+- [ ] Velocidad idea 2 (después del loop): OCR solo del rectángulo que cambió (diferencia de píxeles antes/después) y reutilizar el resto de las líneas
+- [ ] Velocidad, opción barata: correr las 2 pasadas de Tesseract en paralelo (≈ -1 s); no hecho, pedía solo idea 1
 
 ## Lo que vimos en Clientes
 - Ruta: Comercial (clic) > Maestros (submenú que se abre con HOVER y se cierra si el puntero sale) > Clientes.
@@ -61,6 +66,21 @@ Reto: docs/reto.md · Pruebas de práctica: pruebas/ · Diseño: docs/doc-diseno
 - Clic al centro de la FRASE encontrada, no de la línea.
 - fecha_hoy: regex dd/mm/aaaa a la derecha de la etiqueta "Hoy", validada con date(); sin etiqueta → None (no adivinar con otra fecha de la pantalla).
 - TESSERACT_CMD y TESSDATA_DIR por variable de entorno (AlmaLinux); verificar_tesseract() falla al arrancar si faltan modelos.
+
+### OCR en dos pasadas (13:20-14:00)
+- zonas_oscuras: mediana de luminancia por bloques de 8x8 < 128 → bloques vecinos = zona (encabezado, botón azul). Una letra negra no oscurece la mediana de su bloque; un fondo oscuro sí.
+- Pasada 1 (cuerpo, x1): zonas oscuras pintadas de blanco + borrado de líneas HORIZONTALES finas (rachas >= 30 px). Con el borde, Tesseract tomaba el botón como imagen ("Siguiente", "Nuevo cliente").
+- Pasada 2 (zonas oscuras, x2): cada zona invertida y con el fondo estirado a blanco, apiladas en UN mosaico → una sola llamada a Tesseract; las cajas se devuelven a coordenadas reales.
+- Borrar también las verticales dejó a psm 3 sin NINGUNA palabra con el menú abierto (hover de Maestros). Medido en 3 pantallas: solo horizontales pasa las 3. Respaldo: si el cuerpo da < 3 palabras, se relee sin borrar líneas.
+- Tiempos (misma corrida, mediana de 4): bienvenida 1.92 s antes → 1.95 s ahora; Clientes 4.70 s → 5.64 s (cuerpo 4.1 + oscuras 1.4). La idea 1 no acelera: Tesseract tarda por cantidad de texto, no por píxeles, y la 2.ª llamada cuesta ~1 s de arranque. Se mantiene porque lee Buscar/Siguiente y conserva más tildes (x1 lee "Rodríguez", x2 "Rodriguez"). Laptop con mucho ruido de medición (±1 s).
+- tessedit_do_invert=0 probado: sin ganancia medible → revertido.
+
+### Campos (escribir_en_campo, opción A)
+- detectar_campos (sin OCR, 0.1–0.2 s): borde horizontal arriba y abajo con los mismos extremos, 14–40 px de alto, interior BLANCO puro (>= 250; los botones son grises). Descartadas las cajas pegadas a otra (celdas de tabla) y las que contienen otra (recuadro del formulario). Combo = flecha oscura en los últimos ~22 px con franja clara antes.
+- campo_de_etiqueta: el más cercano DEBAJO o A LA DERECHA de la etiqueta, a <= 30 px (el título "Clientes" quedaba a 34 px de la caja de Nombre). Más lejos → error, no se adivina.
+- Clic, Ctrl+A, escribir el texto DEL ARGUMENTO, apartar puntero, releer SOLO la caja (psm 7, x2, ~0.8 s). Igual → ok; igual salvo tildes → ok con aviso (límite del OCR); distinto → error. Combo → error.
+- Etiqueta ambigua ("Nombre" también está en "Razón social o nombre"): mismo desempate que clic_en_texto (etiqueta sola en su línea) + solo cuentan las que tienen caja.
+- Hover: el resaltado cambia la lectura del propio elemento ("Maemtros"); ya no cuenta como texto nuevo (se excluye lo que se solapa con el elemento y los símbolos sueltos).
 
 ### Acción
 - Puntero apartado a una zona de color uniforme elegida mirando la captura (no coordenada de un elemento); se prueba primero cerca de la esquina inferior derecha.

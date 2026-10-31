@@ -1,7 +1,7 @@
 # Secretos: NUNCA al repo
 .env
+.env*
 *.env
-!.env.example
 
 # Entorno virtual
 venv/
@@ -18,9 +18,10 @@ logs/*
 # Python
 __pycache__/
 *.pyc
-.env*
-!.env.example
 tessdata/
 
 # Ajustes locales de Claude Code (no compartir)
 .claude/settings.local.json
+
+# Excepción (AL FINAL para que nada la anule): la plantilla sin valores sí viaja
+!.env.example

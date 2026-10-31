@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date
@@ -48,7 +49,9 @@ def verificar_tesseract() -> None:
     pytesseract.get_tesseract_version()  # lanza TesseractNotFoundError si no está
 # Valores por defecto: se fijan tras comparar en scripts/comparar_ocr.py
 PSM = 3
-ESCALA = 2   # x2: lee el encabezado oscuro (fecha "Hoy"); ver PLAN.md
+ESCALA = 1           # cuerpo (texto oscuro sobre claro): x1 basta y conserva mejor las tildes
+ESCALA_OSCURAS = 2   # zonas oscuras (encabezado, botón azul): invertidas y a x2; ver PLAN.md
+UMBRAL_OSCURO = 128  # luminancia mediana de un bloque por debajo de la cual es "fondo oscuro"
 
 
 # ---------------------------------------------------------------- estructuras
@@ -167,8 +170,250 @@ def agrupar_lineas(palabras: list[Palabra], factor_hueco: float = 1.2) -> list[L
     return lineas
 
 
-def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA) -> list[Linea]:
-    return agrupar_lineas(ocr_palabras(imagen, psm, escala))
+# ---------------------------------------------------------------- preproceso
+def gris(imagen: np.ndarray) -> np.ndarray:
+    """RGB -> luminancia float32 (0..255)."""
+    return imagen[..., :3].astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+
+
+def zonas_oscuras(g: np.ndarray, bloque: int = 8, umbral: float = UMBRAL_OSCURO,
+                  min_w: int = 24, min_h: int = 12) -> list[tuple[int, int, int, int]]:
+    """Rectángulos de FONDO oscuro (encabezado, botones de color) donde el texto es
+    claro. Tesseract espera texto oscuro sobre claro y ahí falla ("Buscar").
+    Se mide la mediana por bloques de 8x8: una letra negra no oscurece la mediana
+    de su bloque, un fondo oscuro sí. Bloques vecinos oscuros = una zona; su caja
+    se ajusta a las filas/columnas cuya mediana es oscura (bordes exactos)."""
+    alto, ancho = g.shape
+    gh, gw = alto // bloque, ancho // bloque
+    bl = g[:gh * bloque, :gw * bloque].reshape(gh, bloque, gw, bloque).transpose(0, 2, 1, 3)
+    oscuro = np.median(bl.reshape(gh, gw, -1), axis=2) < umbral
+    visto = np.zeros_like(oscuro)
+    rects = []
+    for i, j in zip(*np.nonzero(oscuro)):
+        if visto[i, j]:
+            continue
+        pila, visto[i, j] = [(i, j)], True
+        i0 = i1 = i
+        j0 = j1 = j
+        while pila:
+            a, c = pila.pop()
+            i0, i1, j0, j1 = min(i0, a), max(i1, a), min(j0, c), max(j1, c)
+            for na, nc in ((a + 1, c), (a - 1, c), (a, c + 1), (a, c - 1)):
+                if 0 <= na < gh and 0 <= nc < gw and oscuro[na, nc] and not visto[na, nc]:
+                    visto[na, nc] = True
+                    pila.append((na, nc))
+        y0, y1 = max(0, (i0 - 1) * bloque), min(alto, (i1 + 2) * bloque)
+        x0, x1 = max(0, (j0 - 1) * bloque), min(ancho, (j1 + 2) * bloque)
+        sub = g[y0:y1, x0:x1]
+        filas = np.nonzero(np.median(sub, axis=1) < umbral)[0]
+        cols = np.nonzero(np.median(sub, axis=0) < umbral)[0]
+        if len(filas) and len(cols):
+            r = (int(x0 + cols[0]), int(y0 + filas[0]),
+                 int(cols[-1] - cols[0] + 1), int(filas[-1] - filas[0] + 1))
+            if r[2] >= min_w and r[3] >= min_h:
+                rects.append(r)
+    return rects
+
+
+def _en_racha(mask: np.ndarray, n: int, eje: int) -> np.ndarray:
+    """True donde el píxel pertenece a una racha de >= n Trues seguidos a lo largo de `eje`."""
+    m = np.moveaxis(mask, eje, -1).astype(np.int32)
+    cero = np.zeros(m.shape[:-1] + (1,), np.int32)
+    cs = np.concatenate([cero, np.cumsum(m, axis=-1)], axis=-1)
+    llena = (cs[..., n:] - cs[..., :-n]) == n                 # ventana [k, k+n) llena
+    cf = np.concatenate([cero, np.cumsum(llena, axis=-1)], axis=-1)
+    k = np.arange(m.shape[-1])
+    hi = np.minimum(k, llena.shape[-1] - 1) + 1
+    lo = np.maximum(k - n + 1, 0)
+    return np.moveaxis((cf[..., hi] - cf[..., lo]) > 0, -1, eje)
+
+
+def quitar_lineas(g: np.ndarray, d: int = 2, contraste: float = 20,
+                  largo_h: int = 30, largo_v: int | None = None) -> np.ndarray:
+    """Borra líneas finas (bordes de botones, campos y tabla). Con un borde alrededor,
+    Tesseract toma el botón como imagen y no lo lee ("Siguiente", "Nuevo cliente").
+    Línea = píxel distinto de sus vecinos a +-d px en la perpendicular, en una racha
+    recta de >= largo px. Los trazos de letras son más cortos (~10 px) y sobreviven.
+    Por defecto SOLO horizontales: borrar ambas dejó a psm 3 sin ninguna palabra con
+    un menú abierto (medido en bienvenida, menú con hover y Clientes; ver PLAN.md)."""
+    g = g.copy()
+    for eje, largo in ((0, largo_h), (1, largo_v)):
+        if largo is None:
+            continue
+        a, c = np.roll(g, d, axis=eje), np.roll(g, -d, axis=eje)
+        borde = (np.abs(g - a) > contraste) & (np.abs(g - c) > contraste)
+        lin = _en_racha(borde, largo, 1 - eje)
+        g[lin] = ((a + c) / 2)[lin]
+    return g
+
+
+def _ocr_gris(g: np.ndarray, psm: int, escala: int) -> dict:
+    img = Image.fromarray(np.clip(g, 0, 255).astype(np.uint8))
+    if escala != 1:
+        img = img.resize((img.width * escala, img.height * escala), Image.LANCZOS)
+    return pytesseract.image_to_data(img, lang=IDIOMAS, config=f"--psm {psm}",
+                                     output_type=pytesseract.Output.DICT)
+
+
+def _palabras_de(datos: dict):
+    for i, texto in enumerate(datos["text"]):
+        texto, conf = texto.strip(), float(datos["conf"][i])
+        if texto and conf >= 0:
+            yield texto, datos["left"][i], datos["top"][i], datos["width"][i], datos["height"][i], conf
+
+
+def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
+                  escala_oscuras: int = ESCALA_OSCURAS, tiempos: dict | None = None) -> list[Linea]:
+    """Dos pasadas de OCR sobre la misma captura:
+      1. Cuerpo a x`escala`, con las zonas oscuras pintadas de blanco (sin basura ni duplicados).
+      2. Zonas oscuras invertidas (texto claro -> oscuro), con el fondo estirado a blanco,
+         apiladas en UN mosaico y leídas a x`escala_oscuras` (una sola llamada a Tesseract).
+    En ambas se borran las líneas finas antes del OCR. Las cajas vuelven en px reales."""
+    t0 = time.perf_counter()
+    g = gris(imagen)
+    rects = zonas_oscuras(g)
+    cuerpo = g.copy()
+    for x, y, w, h in rects:
+        cuerpo[y:y + h, x:x + w] = 255
+    t1 = time.perf_counter()
+    datos = list(_palabras_de(_ocr_gris(quitar_lineas(cuerpo), psm, escala)))
+    if len(datos) < 3:
+        # Respaldo: el análisis de página de psm 3 puede quedarse en blanco tras el
+        # preproceso; se repite sin borrar líneas antes que devolver una pantalla vacía.
+        datos = list(_palabras_de(_ocr_gris(cuerpo, psm, escala)))
+    palabras = [Palabra(t, round(x / escala), round(y / escala), round(w / escala), round(h / escala), c)
+                for t, x, y, w, h, c in datos]
+    t2 = time.perf_counter()
+    if rects:
+        m = 10  # margen blanco alrededor de cada pieza del mosaico
+        piezas, oy = [], m
+        for x, y, w, h in rects:
+            inv = 255 - g[y:y + h, x:x + w]
+            inv = np.clip(inv * (255.0 / max(float(np.median(inv)), 1.0)), 0, 255)  # fondo -> blanco
+            piezas.append((oy, x, y, inv))
+            oy += h + 2 * m
+        mosaico = np.full((oy, max(w for _, _, w, _ in rects) + 2 * m), 255.0, np.float32)
+        for py, _, _, inv in piezas:
+            mosaico[py:py + inv.shape[0], m:m + inv.shape[1]] = inv
+        mosaico = quitar_lineas(mosaico)
+        e = escala_oscuras
+        for t, x, y, w, h, c in _palabras_de(_ocr_gris(mosaico, psm, e)):
+            cy = (y + h / 2) / e
+            for py, rx, ry, inv in piezas:      # a qué pieza pertenece -> coordenadas reales
+                if py <= cy < py + inv.shape[0]:
+                    palabras.append(Palabra(t, round(rx + x / e - m), round(ry + y / e - py),
+                                            round(w / e), round(h / e), c))
+                    break
+    t3 = time.perf_counter()
+    if tiempos is not None:
+        tiempos.update(preproceso=t1 - t0, ocr_cuerpo=t2 - t1, ocr_oscuras=t3 - t2)
+    return agrupar_lineas(palabras)
+
+
+@dataclass
+class Campo:
+    x: int
+    y: int
+    w: int
+    h: int
+    combo: bool = False     # tiene flecha a la derecha: es un desplegable, no se escribe en él
+
+    @property
+    def caja(self) -> tuple[int, int, int, int]:
+        return self.x, self.y, self.w, self.h
+
+    @property
+    def interior(self) -> tuple[int, int, int, int]:
+        """Caja sin el borde: lo que se relee con OCR tras escribir."""
+        return self.x + 2, self.y + 2, self.w - 4, self.h - 4
+
+    @property
+    def centro(self) -> tuple[int, int]:
+        return self.x + self.w // 2, self.y + self.h // 2
+
+
+def _segmentos(fila: np.ndarray) -> list[tuple[int, int]]:
+    """Tramos [x0, x1) de Trues seguidos en un vector booleano."""
+    d = np.diff(np.concatenate([[0], fila.astype(np.int8), [0]]))
+    return list(zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]))
+
+
+def detectar_campos(imagen: np.ndarray, min_w: int = 40, alto_min: int = 14,
+                    alto_max: int = 40) -> list[Campo]:
+    """Cajas de texto (y combos) por geometría, sin OCR: un borde horizontal arriba y
+    otro abajo con los mismos extremos (+-3 px), separados 14-40 px, con interior
+    claro (mediana >= 200). Así se ubica un campo VACÍO, que el OCR no puede ver.
+    Combo = interior con trazo oscuro en los últimos ~22 px (la flecha) y una
+    franja clara justo antes."""
+    g = gris(imagen)
+    a, c = np.roll(g, 2, axis=0), np.roll(g, -2, axis=0)
+    borde = (np.abs(g - a) > 20) & (np.abs(g - c) > 20)
+    lineas_h = _en_racha(borde, min_w, 1)
+    segs: list[tuple[int, int, int]] = []          # (y, x0, x1), sin repetir bordes gruesos
+    for y in np.nonzero(lineas_h.any(axis=1))[0]:
+        for x0, x1 in _segmentos(lineas_h[y]):
+            if not any(abs(y - sy) <= 2 and abs(x0 - sx0) <= 3 and abs(x1 - sx1) <= 3 for sy, sx0, sx1 in segs):
+                segs.append((int(y), int(x0), int(x1)))
+    campos: list[Campo] = []
+    for i, (yt, x0, x1) in enumerate(segs):
+        abajo = [(yb, bx0, bx1) for yb, bx0, bx1 in segs[i + 1:]
+                 if alto_min <= yb - yt <= alto_max and abs(bx0 - x0) <= 3 and abs(bx1 - x1) <= 3]
+        if not abajo:
+            continue
+        yb = min(abajo)[0]                           # el borde inferior más cercano
+        interior = g[yt + 2:yb - 1, x0 + 2:x1 - 2]
+        # Blanco puro: los botones tienen degradado gris (~235-245) y no son campos.
+        if interior.size == 0 or np.median(interior) < 250:
+            continue
+        flecha = interior[:, -22:-4]
+        antes = interior[:, -34:-24]
+        combo = bool((flecha < 120).any() and antes.size and (antes > 200).all())
+        campos.append(Campo(x0, yt, x1 - x0, yb - yt + 1, combo))
+    # Un campo que contiene a otro (el recuadro del formulario) no es un campo.
+    campos = [k for k in campos if not any(o is not k and o.x >= k.x and o.y >= k.y and
+                                           o.x + o.w <= k.x + k.w and o.y + o.h <= k.y + k.h
+                                           for o in campos)]
+
+    # Celdas de tabla: comparten borde con otra caja (arriba/abajo o a los lados).
+    # Un campo real está separado de los demás por margen.
+    def pegadas(k: Campo, o: Campo) -> bool:
+        solape_x = min(k.x + k.w, o.x + o.w) - max(k.x, o.x) > 0
+        solape_y = min(k.y + k.h, o.y + o.h) - max(k.y, o.y) > 0
+        return ((solape_x and (abs(k.y + k.h - o.y) <= 3 or abs(o.y + o.h - k.y) <= 3)) or
+                (solape_y and (abs(k.x + k.w - o.x) <= 3 or abs(o.x + o.w - k.x) <= 3)))
+    return [k for k in campos if not any(o is not k and pegadas(k, o) for o in campos)]
+
+
+def campo_de_etiqueta(campos: list[Campo], etiqueta: tuple[int, int, int, int],
+                      max_dist: int = 30) -> tuple[Campo | None, str]:
+    """El campo de una etiqueta: el más cercano que esté DEBAJO (empieza bajo la
+    etiqueta y se solapa en x) o A LA DERECHA (misma franja vertical). Más lejos de
+    max_dist px -> None: mejor un error claro que escribir en el campo equivocado."""
+    lx, ly, lw, lh = etiqueta
+    opciones = []
+    for k in campos:
+        if k.y >= ly + lh - 2 and k.x <= lx + lw and k.x + k.w >= lx:            # debajo
+            opciones.append((abs(k.y - (ly + lh)) + abs(k.x - lx) / 4, "debajo", k))
+        elif k.x >= lx + lw - 2 and k.y <= ly + lh // 2 <= k.y + k.h:          # derecha
+            opciones.append((k.x - (lx + lw), "derecha", k))
+    opciones = sorted((o for o in opciones if o[0] <= max_dist), key=lambda o: o[0])
+    if not opciones:
+        return None, f"no hay caja de texto a <= {max_dist} px debajo ni a la derecha de la etiqueta"
+    d, donde, k = opciones[0]
+    return k, f"caja {k.caja} {donde} de la etiqueta (a {d:.0f} px)"
+
+
+def leer_zona(imagen: np.ndarray, caja: tuple[int, int, int, int], escala: int = 2) -> str:
+    """OCR de UN rectángulo (p. ej. un campo recién escrito): psm 7 = una sola línea.
+    Recorte pequeño -> rápido. Si el fondo es oscuro se invierte."""
+    x, y, w, h = caja
+    g = gris(imagen)[max(0, y):y + h, max(0, x):x + w]
+    if g.size == 0:
+        return ""
+    if np.median(g) < UMBRAL_OSCURO:
+        g = 255 - g
+    g = np.pad(g, 8, constant_values=float(np.median(g)))
+    return " ".join(t for t, *_ in _palabras_de(_ocr_gris(g, 7, escala)))
 
 
 def captura_limpia(vnc):
