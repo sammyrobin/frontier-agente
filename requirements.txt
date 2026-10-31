@@ -5,3 +5,8 @@ pycryptodome==4.2.0
 pytesseract==0.3.13
 python-dotenv==1.2.4
 websockets==17.4
+fastapi==0.162.0
+starlette==1.10.0
+pydantic==2.14.2
+pydantic_core==2.50.2
+uvicorn==0.54.0

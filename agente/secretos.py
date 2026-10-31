@@ -11,7 +11,7 @@ import re
 
 # Variables de entorno que se consideran secretas si existen.
 VARIABLES_SECRETAS = ("OPENROUTER_API_KEY", "ESCRITORIO_TOKEN", "ESCRITORIO_PASSWORD",
-                      "ESCRITORIO_URL", "AGENTE_TOKEN", "API_TOKEN")
+                      "ESCRITORIO_URL", "AGENTE_TOKEN", "API_TOKEN", "EQUIPO_TOKEN")
 MARCA = "[oculto]"
 
 

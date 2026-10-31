@@ -1,0 +1,26 @@
+# Instalar como root:
+#   cp /home/frontier/agente/deploy/frontier.service /etc/systemd/system/frontier.service
+#   systemctl daemon-reload && systemctl enable --now frontier
+[Unit]
+Description=Frontier - agente que opera el escritorio (API FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=frontier
+Group=frontier
+WorkingDirectory=/home/frontier/agente
+EnvironmentFile=/home/frontier/agente/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=TESSDATA_DIR=/home/frontier/agente/tessdata
+ExecStart=/home/frontier/agente/venv/bin/uvicorn api.main:app --host 127.0.0.1 --port 8787 --workers 1
+Restart=always
+RestartSec=3
+CPUQuota=150%
+MemoryMax=1500M
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
