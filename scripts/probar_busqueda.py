@@ -50,6 +50,7 @@ def main():
     print(f"reset: HTTP {codigo}")
     if codigo != 200:
         sys.exit(1)
+    time.sleep(2.0)     # el navegador del escritorio se reinicia tras /__reset
     vnc = ClienteVNC(os.environ["ESCRITORIO_URL"], os.environ["ESCRITORIO_PASSWORD"])
     try:
         imagen, lineas, _ = observar(vnc)

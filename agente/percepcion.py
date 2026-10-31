@@ -381,6 +381,12 @@ def detectar_campos(imagen: np.ndarray, min_w: int = 40, alto_min: int = 14,
         # Blanco puro: los botones tienen degradado gris (~235-245) y no son campos.
         if interior.size == 0 or np.median(interior) < 250:
             continue
+        # Bordes verticales: sobre un panel BLANCO, el hueco entre dos cajas apiladas tiene
+        # borde arriba y abajo (el de cada caja) pero no lados. Visto en un formulario de
+        # edición: esa "caja fantasma" quedaba pegada a las reales y las eliminaba todas.
+        lados = [g[yt + 3:yb - 2, max(0, x - 2):x + 3].min(axis=1) for x in (x0, x1)]
+        if any(l.size == 0 or np.mean(l < np.median(interior) - 20) < 0.8 for l in lados):
+            continue
         flecha = interior[:, -22:-4]
         antes = interior[:, -34:-24]
         combo = bool((flecha < 120).any() and antes.size and (antes > 200).all())
@@ -582,3 +588,54 @@ def buscar_texto(lineas: list[Linea], objetivo: str,
             if r >= umbral:
                 flexibles.append(_candidato(v, ln, "flexible", r))
     return ordenar([c for c in flexibles if seguro(c)])
+
+
+# ---------------- ventanas emergentes (modales) ----------------
+def detectar_modal(imagen: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Caja (x, y, w, h) de una ventana emergente, o None. Solo geometría, sin OCR ni
+    textos de ninguna app: un panel rectangular (bordes arriba/abajo con los mismos
+    extremos y bordes laterales) que flota sobre la página y además cumple una de:
+      a) el fondo alrededor está OSCURECIDO (velo): el anillo de 6-24 px fuera del panel
+         es mucho más oscuro que el interior;
+      b) está centrado en la pantalla (horizontal y vertical) y no toca los bordes.
+    Un formulario o una tabla normales están alineados a la izquierda y sin velo."""
+    g = gris(imagen)
+    alto, ancho = g.shape
+    a, c = np.roll(g, 2, axis=0), np.roll(g, -2, axis=0)
+    borde = (np.abs(g - a) > 15) | (np.abs(g - c) > 15)
+    vert = (np.abs(g - np.roll(g, 2, axis=1)) > 15) | (np.abs(g - np.roll(g, -2, axis=1)) > 15)
+    min_w = int(ancho * 0.2)
+    lineas_h = _en_racha(borde, min_w, 1)
+    segs: list[tuple[int, int, int]] = []
+    for y in np.nonzero(lineas_h.any(axis=1))[0]:
+        for x0, x1 in _segmentos(lineas_h[y]):
+            if x1 - x0 < ancho * 0.97 and not any(abs(y - sy) <= 3 and abs(x0 - sx0) <= 4 and abs(x1 - sx1) <= 4
+                                                    for sy, sx0, sx1 in segs):
+                segs.append((int(y), int(x0), int(x1)))
+    mejor = None
+    for i, (yt, x0, x1) in enumerate(segs):
+        for yb, bx0, bx1 in segs[i + 1:]:
+            if yb - yt < 80 or yb - yt > alto * 0.9 or abs(bx0 - x0) > 4 or abs(bx1 - x1) > 4:
+                continue
+            if x0 < 4 or x1 > ancho - 4:
+                continue
+            # Bordes laterales: alguna columna cerca de cada extremo es borde casi entera.
+            lado = lambda x: max(float(np.mean(vert[yt + 4:yb - 4, xx])) for xx in range(max(0, x - 3), min(ancho, x + 4)))
+            if lado(x0) < 0.7 or lado(x1 - 1) < 0.7:
+                continue
+            interior = np.median(g[yt + 3:yb - 3, x0 + 3:x1 - 3])
+            anillo = np.concatenate([g[max(0, yt - 24):max(0, yt - 6), x0:x1].ravel(),
+                                     g[yb + 6:yb + 24, x0:x1].ravel(),
+                                     g[yt:yb, max(0, x0 - 24):max(0, x0 - 6)].ravel(),
+                                     g[yt:yb, x1 + 6:x1 + 24].ravel()])
+            velo = anillo.size > 0 and np.median(anillo) < 0.7 * interior
+            cx, cy = (x0 + x1) / 2, (yt + yb) / 2
+            centrado = (abs(cx - ancho / 2) < ancho * 0.1 and abs(cy - alto / 2) < alto * 0.25
+                        and yt > alto * 0.08 and x1 - x0 < ancho * 0.8)
+            if velo or centrado:
+                # Preferir el velo; entre iguales, el panel más chico (el más grande suele
+                # ser la tabla de la página que asoma alrededor del modal).
+                area = (0 if velo else 10 ** 7) + (x1 - x0) * (yb - yt)
+                if mejor is None or area < mejor[0]:
+                    mejor = (area, (x0, int(yt), x1 - x0, int(yb - yt)))
+    return mejor[1] if mejor else None
