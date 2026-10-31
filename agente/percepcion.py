@@ -266,7 +266,7 @@ def _palabras_de(datos: dict):
             yield texto, datos["left"][i], datos["top"][i], datos["width"][i], datos["height"][i], conf
 
 
-def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
+def _leer_base(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
                   escala_oscuras: int = ESCALA_OSCURAS, tiempos: dict | None = None,
                   paralelo: bool = True) -> list[Linea]:
     """Dos pasadas de OCR sobre la misma captura:
@@ -324,6 +324,36 @@ def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
         # En paralelo, ocr_oscuras es solo la espera extra tras terminar el cuerpo.
         tiempos.update(preproceso=t1 - t0, ocr_cuerpo=t2 - t1, ocr_oscuras=t3 - t2)
     return agrupar_lineas(palabras)
+
+
+def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
+                  escala_oscuras: int = ESCALA_OSCURAS, tiempos: dict | None = None,
+                  paralelo: bool = True, modal: bool = True) -> list[Linea]:
+    """OCR de la pantalla (ver _leer_base). Si hay una ventana emergente (detectar_modal,
+    solo geometría), su zona se relee APARTE en un recorte: con el fondo velado, el análisis
+    de página de Tesseract sobre la pantalla entera suele perder todo el texto del modal.
+    Las líneas del recorte reemplazan a las que la pasada completa leyó en esa zona."""
+    lineas = _leer_base(imagen, psm, escala, escala_oscuras, tiempos, paralelo)
+    if not modal:
+        return lineas
+    caja = detectar_modal(imagen)
+    if caja is None:
+        return lineas
+    alto, ancho = imagen.shape[:2]
+    x, y, w, h = caja
+    # La caja detectada puede ser solo el cuerpo (sin barra de título ni pie de botones).
+    x0, x1 = max(0, x - 4), min(ancho, x + w + 4)
+    y0, y1 = max(0, y - 48), min(alto, y + h + 56)
+    recorte = np.ascontiguousarray(imagen[y0:y1, x0:x1])
+    propias = []
+    for ln in _leer_base(recorte, psm, escala, escala_oscuras, None, paralelo):
+        for p in ln.palabras:
+            propias.append(Palabra(p.texto, p.x + x0, p.y + y0, p.w, p.h, p.confianza))
+    if not propias:
+        return lineas
+    fuera = [p for ln in lineas for p in ln.palabras
+             if not (x0 <= p.centro[0] < x1 and y0 <= p.centro[1] < y1)]
+    return agrupar_lineas(fuera + propias)
 
 
 @dataclass

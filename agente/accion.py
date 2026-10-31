@@ -385,7 +385,9 @@ def cerrar_modal(vnc, imagen: np.ndarray, lineas: list[Linea]) -> tuple[np.ndarr
     caja = detectar_modal(imagen)
     if caja is None:
         return imagen, lineas, ""
-    texto = " / ".join(ln.texto for ln in lineas if _dentro(ln.caja, caja))[:400]
+    zx, zy, zw, zh = caja   # zona ampliada como en leer_pantalla: título y pie del modal
+    zona = (zx - 4, zy - 48, zw + 8, zh + 104)
+    texto = " / ".join(ln.texto for ln in lineas if _dentro(ln.caja, zona) and len(ln.texto) > 2)[:600]
     informe = f"Al empezar había una ventana emergente {caja} con el texto: «{texto}». "
     apartar_mouse(vnc, imagen)
     vnc.pulsar("esc")
