@@ -17,6 +17,7 @@ import os
 import re
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 from difflib import SequenceMatcher
@@ -247,6 +248,9 @@ def quitar_lineas(g: np.ndarray, d: int = 2, contraste: float = 20,
     return g
 
 
+_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr")  # 2.ª llamada de Tesseract
+
+
 def _ocr_gris(g: np.ndarray, psm: int, escala: int) -> dict:
     img = Image.fromarray(np.clip(g, 0, 255).astype(np.uint8))
     if escala != 1:
@@ -263,7 +267,8 @@ def _palabras_de(datos: dict):
 
 
 def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
-                  escala_oscuras: int = ESCALA_OSCURAS, tiempos: dict | None = None) -> list[Linea]:
+                  escala_oscuras: int = ESCALA_OSCURAS, tiempos: dict | None = None,
+                  paralelo: bool = True) -> list[Linea]:
     """Dos pasadas de OCR sobre la misma captura:
       1. Cuerpo a x`escala`, con las zonas oscuras pintadas de blanco (sin basura ni duplicados).
       2. Zonas oscuras invertidas (texto claro -> oscuro), con el fondo estirado a blanco,
@@ -275,18 +280,10 @@ def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
     cuerpo = g.copy()
     for x, y, w, h in rects:
         cuerpo[y:y + h, x:x + w] = 255
-    t1 = time.perf_counter()
-    datos = list(_palabras_de(_ocr_gris(quitar_lineas(cuerpo), psm, escala)))
-    if len(datos) < 3:
-        # Respaldo: el análisis de página de psm 3 puede quedarse en blanco tras el
-        # preproceso; se repite sin borrar líneas antes que devolver una pantalla vacía.
-        datos = list(_palabras_de(_ocr_gris(cuerpo, psm, escala)))
-    palabras = [Palabra(t, round(x / escala), round(y / escala), round(w / escala), round(h / escala), c)
-                for t, x, y, w, h, c in datos]
-    t2 = time.perf_counter()
+    m, e = 10, escala_oscuras  # margen blanco alrededor de cada pieza del mosaico
+    piezas, mosaico = [], None
     if rects:
-        m = 10  # margen blanco alrededor de cada pieza del mosaico
-        piezas, oy = [], m
+        oy = m
         for x, y, w, h in rects:
             inv = 255 - g[y:y + h, x:x + w]
             inv = np.clip(inv * (255.0 / max(float(np.median(inv)), 1.0)), 0, 255)  # fondo -> blanco
@@ -296,8 +293,26 @@ def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
         for py, _, _, inv in piezas:
             mosaico[py:py + inv.shape[0], m:m + inv.shape[1]] = inv
         mosaico = quitar_lineas(mosaico)
-        e = escala_oscuras
-        for t, x, y, w, h, c in _palabras_de(_ocr_gris(mosaico, psm, e)):
+    cuerpo_sin_lineas = quitar_lineas(cuerpo)
+    t1 = time.perf_counter()
+
+    # Las 2 llamadas a Tesseract son procesos aparte: en hilos corren de verdad en
+    # paralelo (2 núcleos) y el tiempo total es el de la más lenta, no la suma.
+    if paralelo and mosaico is not None:
+        fut = _POOL.submit(_ocr_gris, mosaico, psm, e)
+    else:
+        fut = None
+    datos = list(_palabras_de(_ocr_gris(cuerpo_sin_lineas, psm, escala)))
+    if len(datos) < 3:
+        # Respaldo: el análisis de página de psm 3 puede quedarse en blanco tras el
+        # preproceso; se repite sin borrar líneas antes que devolver una pantalla vacía.
+        datos = list(_palabras_de(_ocr_gris(cuerpo, psm, escala)))
+    palabras = [Palabra(t, round(x / escala), round(y / escala), round(w / escala), round(h / escala), c)
+                for t, x, y, w, h, c in datos]
+    t2 = time.perf_counter()
+    if mosaico is not None:
+        datos_osc = fut.result() if fut else _ocr_gris(mosaico, psm, e)
+        for t, x, y, w, h, c in _palabras_de(datos_osc):
             cy = (y + h / 2) / e
             for py, rx, ry, inv in piezas:      # a qué pieza pertenece -> coordenadas reales
                 if py <= cy < py + inv.shape[0]:
@@ -306,6 +321,7 @@ def leer_pantalla(imagen: np.ndarray, psm: int = PSM, escala: int = ESCALA,
                     break
     t3 = time.perf_counter()
     if tiempos is not None:
+        # En paralelo, ocr_oscuras es solo la espera extra tras terminar el cuerpo.
         tiempos.update(preproceso=t1 - t0, ocr_cuerpo=t2 - t1, ocr_oscuras=t3 - t2)
     return agrupar_lineas(palabras)
 

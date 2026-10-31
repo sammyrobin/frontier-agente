@@ -27,10 +27,23 @@ Reto: docs/reto.md · Pruebas de práctica: pruebas/ · Diseño: docs/doc-diseno
 - [x] OCR en dos pasadas: lee "Buscar" (blanco sobre azul) y "Siguiente"/"Nuevo cliente" (botones con borde). probar_percepcion.py: 25/25 OK
 - [x] Velocidad idea 1 (cuerpo x1, zonas oscuras x2): medida, NO acelera (ver tabla); se queda por exactitud
 - [x] escribir_en_campo (opción A) + scripts/probar_busqueda.py: Nombre="Ramírez" → Buscar → 9 filas, todas Ramírez
-- [ ] Combo (Ciudad): diseño en respuesta.md, sin implementar
-- [ ] OCR de la tabla: códigos CL subrayados mal leídos ("1-095", "10032", "cL-0046") y tildes perdidas en algunas celdas
-- [ ] Velocidad idea 2 (después del loop): OCR solo del rectángulo que cambió (diferencia de píxeles antes/después) y reutilizar el resto de las líneas
-- [ ] Velocidad, opción barata: correr las 2 pasadas de Tesseract en paralelo (≈ -1 s); no hecho, pedía solo idea 1
+- [x] Las 2 pasadas de Tesseract en paralelo (hilo + proceso aparte): bienvenida 1.97 → 1.16 s, Clientes 4.17 → 3.32 s, mismas líneas. probar_percepcion TODO OK, probar_busqueda OK
+
+## ESTADO al cerrar la sesión (31-oct): percepción + acciones listas, SIN loop todavía
+- Hay: vnc.py, percepcion.py (leer_pantalla, buscar_texto, fecha_hoy, detectar_campos, campo_de_etiqueta, leer_zona), accion.py (observar, clic_en_texto con hover, escribir_en_campo con relectura), reset.py y 3 scripts de prueba.
+- NO hay: LLM, loop, reglas de código, grafo, API, MySQL, despliegue.
+
+## SIGUIENTE: loop básico con LLM (nueva sesión)
+- [ ] agente/loop.py: clasificar → observar → decidir (OpenRouter, solo texto: tarea + OCR + historial) → actuar (clic_en_texto / escribir_en_campo / tecla) → verificar
+- [ ] Reglas en código: máx 2 reintentos/paso, bloquear acción repetida en la misma pantalla, corte 4:30, releer antes de "terminada", buscar antes de crear, filtro de secretos
+- [ ] Resumen final con el formato (respuesta: …; fallida con datos)
+- [ ] Probar con pruebas/E1..E5
+
+## Después del loop básico
+- [ ] Combo (Ciudad), ANTES de las 15:00: diseño en respuesta.md del 31-oct (clic, OCR de la lista, buscar_texto, teclado de respaldo, releer la caja, nunca por posición)
+- [ ] Mejorar OCR de enlaces (texto azul/subrayado) SIN asumir formato (la evaluación es otra app: nada de regex tipo CL-\d{4}). Síntoma hoy: "1-095", "10032", "cL-0046"; también tildes perdidas en celdas
+- [ ] Velocidad idea 2: OCR solo del rectángulo que cambió (diferencia de píxeles antes/después) y reutilizar el resto de las líneas
+- [ ] Agrupar filas de tabla (misma y) en el texto para el LLM
 
 ## Lo que vimos en Clientes
 - Ruta: Comercial (clic) > Maestros (submenú que se abre con HOVER y se cierra si el puntero sale) > Clientes.
