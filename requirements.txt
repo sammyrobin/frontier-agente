@@ -1,0 +1,7 @@
+numpy==2.5.4
+packaging==26.3
+pillow==13.0.0
+pycryptodome==4.2.0
+pytesseract==0.3.13
+python-dotenv==1.2.4
+websockets==17.4
