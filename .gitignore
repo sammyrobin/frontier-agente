@@ -1,0 +1,22 @@
+# Secretos: NUNCA al repo
+.env
+*.env
+!.env.example
+
+# Entorno virtual
+venv/
+.venv/
+
+# Capturas y logs (pesan y pueden mostrar datos)
+capturas/*
+!capturas/.gitkeep
+logs/*
+!logs/.gitkeep
+*.png
+!docs/*.png
+
+# Python
+__pycache__/
+*.pyc
+.env*
+!.env.example
