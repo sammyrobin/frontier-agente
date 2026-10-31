@@ -20,8 +20,19 @@ Reto: docs/reto.md · Pruebas de práctica: pruebas/ · Diseño: docs/doc-diseno
 
 ## Siguiente (13:00-14:00) OCR con coordenadas y acciones
 - [x] percepcion.py: OCR → palabras/líneas con caja, buscar_texto, fecha_hoy (prueba: scripts/probar_percepcion.py, TODO OK, 1.9 s/captura)
-- [ ] accion.py: clic_en_texto("Clientes"), escribir_en_campo(...)
-- [ ] Probar: navegar a Clientes desde un script
+- [x] scripts/reset.py: POST /__reset con Bearer (HTTP 200 {"ok":true})
+- [x] accion.py: apartar_mouse, esperar_cambio, clic_en_texto (Resultado estructurado)
+- [x] Probar: navegar a Clientes desde un script (scripts/probar_navegacion.py: Comercial > Maestros > Clientes OK)
+- [ ] escribir_en_campo: esperando OK del usuario sobre cómo ubicar un campo vacío
+- [ ] OCR no lee texto blanco sobre botón azul ("Buscar") ni "Siguiente"; pierde tildes a veces
+- [ ] OCR x2 de la tabla de Clientes tarda 5.6 s (> 3 s): reducir
+
+## Lo que vimos en Clientes
+- Ruta: Comercial (clic) > Maestros (submenú que se abre con HOVER y se cierra si el puntero sale) > Clientes.
+- Filtros: Nombre, NIT (campos de texto), Ciudad (combo "Todos"), botones Buscar y Limpiar.
+- Aviso: "Busca partes del texto. Distingue tildes: Ramírez no trae Ramirez."
+- Botones Nuevo cliente, Exportar. Tabla: Código (enlace CL-xxxx), Razón social o nombre, NIT, Ciudad, Teléfono, Estado (Activo/Inactivo).
+- Paginación: Anterior (deshabilitado), Página 1, Siguiente. ~20 filas por página. Muchos nombres casi iguales (Abarrotes Moreno x2, Ramírez/Ramirez).
 
 ## 14:00-15:00 Loop con LLM, reglas y grafo
 ## 15:00 Incidente: la app cambia → re-verificar todo
@@ -50,3 +61,9 @@ Reto: docs/reto.md · Pruebas de práctica: pruebas/ · Diseño: docs/doc-diseno
 - Clic al centro de la FRASE encontrada, no de la línea.
 - fecha_hoy: regex dd/mm/aaaa a la derecha de la etiqueta "Hoy", validada con date(); sin etiqueta → None (no adivinar con otra fecha de la pantalla).
 - TESSERACT_CMD y TESSDATA_DIR por variable de entorno (AlmaLinux); verificar_tesseract() falla al arrancar si faltan modelos.
+
+### Acción
+- Puntero apartado a una zona de color uniforme elegida mirando la captura (no coordenada de un elemento); se prueba primero cerca de la esquina inferior derecha.
+- "Cambió la pantalla" = >0.1 % de píxeles distintos con el puntero en el MISMO lugar antes y después (si no, el propio cursor/hover cuenta como cambio).
+- Desempate: si varias candidatas y exactamente una es la línea completa (etiqueta de control) y las demás están dentro de oraciones, se elige esa ("Comercial" del menú vs "comercial." de la bienvenida). Si no, error con la lista (homónimos nunca se eligen solos).
+- Submenús por hover: si el clic no cambia la pantalla, se deja el puntero encima y se exige TEXTO NUEVO por OCR (el resaltado no cuenta). No es reintento; luego 1 reintento de clic y error.
