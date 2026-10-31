@@ -25,3 +25,6 @@ tessdata/
 
 # Excepción (AL FINAL para que nada la anule): la plantilla sin valores sí viaja
 !.env.example
+
+# Trazas del loop (pueden mostrar datos de la app)
+datos/

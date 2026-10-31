@@ -1,0 +1,640 @@
+"""El LOOP (el cerebro): observar -> decidir (LLM) -> validar (código) -> actuar -> registrar.
+
+El LLM solo elige UNA acción por paso, por TEXTO: clic(texto), escribir(etiqueta, valor),
+tecla(nombre), terminar(estado, resumen). Nunca da coordenadas: accion.py ubica el texto.
+
+Reglas que viven AQUÍ (en código, no en el prompt):
+  - clic: el texto tiene que existir en el OCR; si no, se rechaza SIN gastar clic y se
+    repregunta con los textos parecidos.
+  - escribir: el valor sale de la tarea (con variantes plural/género/tildes), de una fecha
+    calculada desde HOY o de una opción visible en pantalla. Todo lo demás se rechaza.
+  - Control destructivo (eliminar, anular...) solo si la tarea lo pide.
+  - Máx 2 fallos seguidos -> Esc y replantear. Acción idéntica sobre la misma pantalla -> bloqueada.
+  - Presupuesto: tiempo medio por paso; con poco tiempo el mensaje dice "te quedan ~N pasos".
+    Corte duro antes del deadline.
+  - LLM: timeout 20 s, 1 reintento (también si el JSON no es válido); luego paso fallido.
+  - Antes de aceptar "terminada": se relee la pantalla y la fecha HOY.
+  - "fallida" se valida: tiene que haber buscado algo y los datos que nombra deben haberse
+    visto en pantalla (1 aviso; si insiste, se acepta).
+Nada aquí es específico de una app: no hay nombres de menús ni de pantallas.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+from agente.accion import Resultado, clic_en_texto, escribir_en_campo, observar, parecidos
+from agente.percepcion import (Linea, buscar_texto, campo_de_etiqueta, detectar_campos, es_destructiva,
+                               fecha_hoy, leer_pantalla, normalizar)
+from agente.secretos import filtrar
+
+RAIZ = Path(__file__).resolve().parent.parent
+DIR_TRAZAS = RAIZ / "datos"
+
+MODELO = os.environ.get("AGENTE_MODELO", "google/gemini-2.5-flash")
+URL_LLM = "https://openrouter.ai/api/v1/chat/completions"
+TIMEOUT_LLM = 20.0
+MAX_PASOS = 45
+MARGEN_FINAL = 12.0         # s antes del deadline en que se corta (para reportar a tiempo)
+PASO_ESTIMADO_INICIAL = 12.0
+PASOS_AVISO = 4             # con <= N pasos estimados restantes se pide terminar
+HISTORIAL_VISIBLE = 8
+
+TECLAS_LLM = {"enter": ["enter"], "esc": ["esc"], "escape": ["esc"], "tab": ["tab"],
+              "abajo": ["down"], "arriba": ["up"], "izquierda": ["left"], "derecha": ["right"],
+              "down": ["down"], "up": ["up"], "left": ["left"], "right": ["right"],
+              "avpag": ["pagedown"], "repag": ["pageup"], "pagedown": ["pagedown"], "pageup": ["pageup"],
+              "inicio": ["home"], "fin": ["end"], "home": ["home"], "end": ["end"],
+              "retroceso": ["backspace"], "backspace": ["backspace"], "supr": ["delete"],
+              "delete": ["delete"], "ctrl+a": ["ctrl", "a"], "shift+tab": ["shift", "tab"],
+              "espacio": [" "], "space": [" "]}
+
+DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+PROMPT_SISTEMA = """Eres un operador de un sistema de gestión de escritorio que nunca has visto. Ves la pantalla
+SOLO como texto leído por OCR (puede tener errores pequeños: tildes perdidas, letras cambiadas).
+Cada paso eliges UNA acción. El código la ejecuta ubicando el texto en pantalla; tú nunca das
+coordenadas.
+
+Acciones:
+- clic(texto): clic sobre un texto visible (menú, botón, enlace, fila, opción de lista).
+  Copia el texto tal como aparece en la pantalla. Para abrir un desplegable (marcado [desplegable]
+  en CAMPOS) haz clic en su etiqueta; luego clic en la opción que aparezca.
+- escribir(etiqueta, valor): escribe en la caja de texto cuya etiqueta visible es `etiqueta`
+  (borra lo que tenía). `valor` sale de la TAREA, literal (o una fecha calculada desde HOY, en el
+  formato que use la app); nunca lo inventes.
+- tecla(nombre): enter, esc, tab, abajo, arriba, avpag, repag, inicio, fin.
+- terminar(estado, resumen): estado "terminada" o "fallida".
+
+Cómo trabajar:
+1. Explora: los menús pueden tener submenús. Usa los clics que ya funcionaron.
+2. Antes de concluir que algo no existe, BÚSCALO (filtro de búsqueda, otra página, otro menú).
+   Un nombre parcial en el filtro (p. ej. una palabra distintiva) aguanta mejor errores de tildes.
+3. Antes de modificar o crear, identifica el registro exacto. Busca primero si ya existe para
+   no duplicar.
+4. Si la búsqueda trae varios registros que encajan igual con lo pedido y la tarea no da un dato
+   para distinguirlos, NO elijas: termina "fallida" nombrando TODOS los identificadores de cada
+   candidato (código y también documento/NIT/número, tal como se ven en la fila).
+5. Si lo pedido no existe en la app tras buscarlo, o la acción pedida no se puede hacer desde
+   esta app (p. ej. llamar, enviar algo fuera del sistema), termina "fallida" diciendo qué
+   buscaste y qué encontraste.
+6. Si la tarea pide algo irreversible sobre muchos registros a la vez (borrar, anular o cambiar
+   todo un grupo) o algo que la propia app marca como restringido, NO lo hagas: "fallida"
+   explicando el alcance (cuántos registros, cuáles).
+7. Toca SOLO lo que pide la tarea. No cambies otros campos, no escribas notas ni observaciones
+   que la tarea no pida, no guardes, exportes ni confirmes nada de más. Cada cosa una sola vez.
+8. Fechas relativas ("hoy", "ayer", "el mes pasado") se cuentan desde la fecha HOY que te doy
+   (la de la app), no desde la fecha real.
+9. Para contar, usa el total que muestra la app si existe; si hay páginas, recórrelas todas y
+   lleva la cuenta en "memoria".
+10. Antes de "terminada", la pantalla debe mostrar el resultado (registro guardado con los
+   valores, total contado, exportación confirmada).
+11. Si un AVISO DEL CÓDIGO rechaza tu acción, corrígela; no repitas lo mismo.
+
+Resumen al terminar:
+- Qué hiciste, en 1-3 frases, con los datos concretos.
+- Pregunta respondida: pon el valor en "respuesta" (número primero; dos datos separados por ";"
+  en el orden preguntado).
+- Fallida: nombra en el resumen y en "datos_razon" los datos que lo explican (identificadores
+  de los candidatos, lo buscado). "respuesta" = null.
+- Nunca incluyas contraseñas, tokens ni direcciones de conexión.
+
+Responde SOLO un objeto JSON con estas claves:
+{"razon": "qué veo y por qué hago esto (corto)",
+ "memoria": "notas que quieres conservar para los siguientes pasos (cuentas parciales, datos vistos) o null",
+ "accion": "clic | escribir | tecla | terminar",
+ "texto": "(clic)", "etiqueta": "(escribir)", "valor": "(escribir)", "tecla": "(tecla)",
+ "estado": "terminada | fallida (terminar)", "resumen": "(terminar)",
+ "respuesta": "valor o null (terminar, solo preguntas respondidas)",
+ "datos_razon": ["(terminar fallida) datos que explican el fallo"]}"""
+
+PROMPT_CLASIFICAR = """Clasifica una instrucción dada a un agente que opera una aplicación de gestión.
+Responde SOLO JSON: {"tipo": "accion | pregunta | posible_fallo",
+"objetivo": "qué hay que lograr, en una frase",
+"datos_de_la_tarea": {"nombre del dato": "valor literal de la instrucción"},
+"motivo": "por qué ese tipo (corto)"}
+"posible_fallo" solo si la instrucción, tal cual, ya pide algo fuera de la app (llamar, enviar
+fuera), algo irreversible sobre muchos registros a la vez, o algo contradictorio. Es una opinión
+inicial: la decisión final se toma mirando la app. Ante la duda, "accion" o "pregunta"."""
+
+
+# ---------------------------------------------------------------- utilidades
+class SinTiempo(Exception):
+    pass
+
+
+@dataclass
+class Paso:
+    n: int
+    accion: dict
+    resultado: str
+    ok: bool
+    pantalla: str = ""        # resumen de la pantalla vista (primeras filas)
+    tokens: int = 0
+    costo: float = 0.0
+    t_llm: float = 0.0
+    t_accion: float = 0.0
+    t_total: float = 0.0
+
+
+@dataclass
+class Estado:
+    tarea: str
+    deadline: float                         # time.time() límite
+    task_id: str
+    hoy: date | None = None
+    clasificacion: dict = field(default_factory=dict)
+    pasos: list[Paso] = field(default_factory=list)
+    clics_ok: list[str] = field(default_factory=list)
+    memoria: str = ""
+    aviso: str = ""
+    hechas: set = field(default_factory=set)        # (firma pantalla, acción) ya ejecutadas
+    fallos_seguidos: int = 0
+    textos_vistos: set = field(default_factory=set)  # normalizados, para validar datos_razon
+    filas_vistas: list = field(default_factory=list)  # filas de pantalla (texto) vistas en la tarea
+    avisos_fallida: int = 0
+    avisos_terminada: int = 0
+    tokens: int = 0
+    costo: float = 0.0
+    inicio: float = field(default_factory=time.time)
+    llamadas_llm: int = 0
+
+    def restante(self) -> float:
+        return self.deadline - time.time()
+
+
+def _sin_json_markdown(s: str) -> str:
+    s = s.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)```", s, re.S)
+    if m:
+        s = m.group(1).strip()
+    if not s.startswith("{"):
+        i, j = s.find("{"), s.rfind("}")
+        if i >= 0 and j > i:
+            s = s[i:j + 1]
+    return s
+
+
+def llamar_llm(mensajes: list[dict], est: Estado, timeout: float = TIMEOUT_LLM) -> tuple[dict | None, str]:
+    """POST a OpenRouter (JSON mode). Timeout 20 s, 1 reintento (error de red o JSON inválido).
+    Devuelve (dict o None, detalle del error)."""
+    clave = os.environ.get("OPENROUTER_API_KEY", "")
+    if not clave:
+        return None, "falta OPENROUTER_API_KEY en el entorno"
+    error = ""
+    msgs = list(mensajes)
+    for intento in (1, 2):
+        t = min(timeout, max(3.0, est.restante() - MARGEN_FINAL / 2))
+        cuerpo = {"model": MODELO, "messages": msgs, "temperature": 0,
+                  "response_format": {"type": "json_object"}, "usage": {"include": True}}
+        req = urllib.request.Request(URL_LLM, data=json.dumps(cuerpo).encode(), headers={
+            "Authorization": f"Bearer {clave}", "Content-Type": "application/json"})
+        est.llamadas_llm += 1
+        try:
+            with urllib.request.urlopen(req, timeout=t) as r:
+                datos = json.load(r)
+        except Exception as e:                                   # timeout, HTTP, red
+            error = f"error LLM ({type(e).__name__})"
+            continue
+        uso = datos.get("usage") or {}
+        est.tokens += int(uso.get("total_tokens") or 0)
+        est.costo += float(uso.get("cost") or 0.0)
+        est._ultimo_uso = (int(uso.get("total_tokens") or 0), float(uso.get("cost") or 0.0))
+        try:
+            contenido = datos["choices"][0]["message"]["content"] or ""
+            obj = json.loads(_sin_json_markdown(contenido))
+            if isinstance(obj, dict):
+                return obj, ""
+            error = "el JSON no es un objeto"
+        except Exception:
+            error = "respuesta sin JSON válido"
+        msgs = msgs + [{"role": "user", "content": "Tu respuesta no era JSON válido. Responde SOLO el objeto JSON."}]
+    return None, error
+
+
+# ---------------------------------------------------------------- pantalla para el LLM
+def filas(lineas: list[Linea]) -> list[list[Linea]]:
+    """Agrupa las líneas del OCR en filas visuales (misma altura +-6 px), izquierda a derecha."""
+    grupos: list[list[Linea]] = []
+    for ln in sorted(lineas, key=lambda l: (l.caja[1], l.caja[0])):
+        cy = ln.caja[1] + ln.caja[3] / 2
+        if grupos:
+            g = grupos[-1]
+            gy = sum(l.caja[1] + l.caja[3] / 2 for l in g) / len(g)
+            if abs(cy - gy) <= 6:
+                g.append(ln)
+                continue
+        grupos.append([ln])
+    return [sorted(g, key=lambda l: l.caja[0]) for g in grupos]
+
+
+def campos_visibles(imagen, lineas: list[Linea]) -> list[str]:
+    """Cajas de texto/desplegables detectadas, con su etiqueta (texto más cercano encima o a
+    la izquierda) y el contenido leído dentro. Un campo vacío no lo ve el OCR: así el LLM
+    sabe que existe."""
+    out = []
+    for k in detectar_campos(imagen):
+        dentro = [ln.texto for ln in lineas
+                  if k.x <= ln.caja[0] + ln.caja[2] / 2 <= k.x + k.w and k.y <= ln.caja[1] + ln.caja[3] / 2 <= k.y + k.h]
+        etiqueta, mejor = None, 1e9
+        for ln in lineas:
+            if ln.texto in dentro:
+                continue
+            campo, _ = campo_de_etiqueta([k], ln.caja)
+            if campo is not None:
+                lx, ly, lw, lh = ln.caja
+                d = abs(k.y - (ly + lh)) + abs(k.x - lx) / 4 if ly + lh <= k.y + 2 else k.x - (lx + lw)
+                if d < mejor:
+                    etiqueta, mejor = ln.texto, d
+        tipo = " [desplegable]" if k.combo else ""
+        valor = " ".join(dentro) if dentro else "(vacío)"
+        out.append(f"- {etiqueta or '(sin etiqueta)'}{tipo}: {valor}")
+    return out
+
+
+def pantalla_para_llm(imagen, lineas: list[Linea]) -> tuple[str, str]:
+    """(texto completo para el LLM, resumen corto para la traza)."""
+    fs = filas(lineas)
+    renglones = [f"[{i}] " + "  |  ".join(l.texto for l in f) for i, f in enumerate(fs)]
+    campos = campos_visibles(imagen, lineas)
+    texto = "\n".join(renglones)
+    if campos:
+        texto += "\n\nCAMPOS (cajas detectadas):\n" + "\n".join(campos)
+    corto = " / ".join(" | ".join(l.texto for l in f) for f in fs[:12])
+    return texto, corto[:600]
+
+
+def firma(lineas: list[Linea]) -> str:
+    return hashlib.md5("\n".join(normalizar(l.texto) for l in lineas).encode()).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------- validación de valores
+def _raiz(tok: str) -> str:
+    """Raíz tosca para comparar variantes: plural y género. 'vencidas' ~ 'vencida' ~ 'vencido'."""
+    if len(tok) > 4 and tok.endswith("es"):
+        tok = tok[:-2]
+    elif len(tok) > 3 and tok.endswith("s"):
+        tok = tok[:-1]
+    if len(tok) > 4 and tok[-1] in "ao":
+        tok = tok[:-1]
+    return tok
+
+
+def _tokens(s: str) -> list[str]:
+    return [t for t in re.split(r"[\s,;:]+", normalizar(s)) if t]
+
+
+def _fecha_de(valor: str) -> date | None:
+    v = valor.strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d", "%m/%Y", "%d/%m/%y"):
+        try:
+            return datetime.strptime(v, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def valor_permitido(valor: str, tarea: str, hoy: date | None, lineas: list[Linea]) -> tuple[bool, str]:
+    """(a) palabras de la tarea con variantes; (b) fecha calculada desde HOY; (c) opción visible."""
+    if not valor.strip():
+        return True, "vacío (limpiar el campo)"
+    nv, nt = normalizar(valor), normalizar(tarea)
+    if nv and re.search(r"(?<!\w)" + re.escape(nv), nt):      # desde inicio de palabra
+        return True, "literal de la tarea"
+    raices_tarea = {_raiz(t) for t in _tokens(tarea)}
+    toks = _tokens(valor)
+    if toks and all(_raiz(t) in raices_tarea or t in nt for t in toks):
+        return True, "palabras de la tarea (con variantes)"
+    f = _fecha_de(valor)
+    if f is not None:
+        ref = hoy or date.today()
+        if abs((f - ref).days) <= 3 * 366:
+            return True, f"fecha {f.isoformat()} (desde HOY {ref.isoformat()})"
+        return False, f"la fecha {f.isoformat()} está demasiado lejos de HOY"
+    if any(c.tipo == "exacta" for c in buscar_texto(lineas, valor)):
+        return True, "opción visible en pantalla"
+    return False, ("ese valor no está en la tarea, no es una fecha calculada desde HOY ni una "
+                   "opción visible. No inventes valores: usa los de la tarea")
+
+
+# ---------------------------------------------------------------- ejecutar una acción
+def _combo_de_etiqueta(imagen, lineas, texto):
+    """Si `texto` es la etiqueta de UN desplegable, devuelve la caja del desplegable."""
+    cands = buscar_texto(lineas, texto)
+    if not cands:
+        return None
+    campos = [k for k in detectar_campos(imagen) if k.combo]
+    hallados = []
+    for c in cands:
+        campo, _ = campo_de_etiqueta(campos, (c.x, c.y, c.w, c.h))
+        if campo is not None and campo not in hallados:
+            hallados.append(campo)
+    return hallados[0] if len(hallados) == 1 else None
+
+
+def ejecutar(vnc, accion: dict, imagen, lineas) -> Resultado:
+    tipo = accion["accion"]
+    if tipo == "clic":
+        combo = _combo_de_etiqueta(imagen, lineas, accion["texto"])
+        if combo is not None:
+            from agente.accion import apartar_mouse, esperar_cambio
+            t0 = time.perf_counter()
+            vnc.clic(*combo.centro)
+            apartar_mouse(vnc, imagen)
+            despues, cambio = esperar_cambio(vnc, imagen, 2.5)
+            lin = leer_pantalla(despues)
+            return Resultado(cambio, f"Clic en el desplegable de '{accion['texto']}' {combo.caja}; "
+                             + ("se abrió/cambió la pantalla" if cambio else "sin cambio de pantalla"),
+                             despues, lin, cambio=cambio, tiempos={"combo": time.perf_counter() - t0})
+        return clic_en_texto(vnc, accion["texto"], imagen, lineas)
+    if tipo == "escribir":
+        return escribir_en_campo(vnc, accion["etiqueta"], accion["valor"], imagen, lineas)
+    if tipo == "tecla":
+        teclas = TECLAS_LLM[normalizar(accion["tecla"]).replace(" ", "")]
+        t0 = time.perf_counter()
+        vnc.pulsar(*teclas)
+        from agente.accion import esperar_cambio
+        despues, cambio = esperar_cambio(vnc, imagen, 1.5)
+        return Resultado(True, f"Tecla {accion['tecla']}" + ("; la pantalla cambió" if cambio else "; sin cambio visible"),
+                         despues, None, cambio=cambio, tiempos={"tecla": time.perf_counter() - t0})
+    raise ValueError(tipo)
+
+
+def validar(accion: dict, est: Estado, lineas: list[Linea], hoy: date | None, fp: str) -> str:
+    """'' si la acción es válida; si no, el aviso para el LLM. No toca la pantalla."""
+    tipo = accion.get("accion")
+    if tipo not in ("clic", "escribir", "tecla", "terminar"):
+        return f"Acción '{tipo}' no existe. Usa clic, escribir, tecla o terminar."
+    if tipo == "clic":
+        texto = str(accion.get("texto") or "").strip()
+        if not texto:
+            return "clic necesita 'texto'."
+        accion["texto"] = texto
+        if es_destructiva(texto) and not es_destructiva(est.tarea):
+            return f"'{texto}' es un control destructivo y la tarea no pide eso. No lo uses."
+        if not buscar_texto(lineas, texto):
+            return (f"'{texto}' no está en la pantalla. Parecidos visibles: {parecidos(lineas, texto)}. "
+                    "Copia un texto de PANTALLA tal cual.")
+    elif tipo == "escribir":
+        etq, val = str(accion.get("etiqueta") or "").strip(), accion.get("valor")
+        if not etq or val is None:
+            return "escribir necesita 'etiqueta' y 'valor'."
+        accion["etiqueta"], accion["valor"] = etq, str(val)
+        if not buscar_texto(lineas, etq):
+            return f"La etiqueta '{etq}' no está en la pantalla. Parecidos: {parecidos(lineas, etq)}."
+        ok, motivo = valor_permitido(accion["valor"], est.tarea, hoy, lineas)
+        if not ok:
+            return f"Valor '{accion['valor']}' rechazado: {motivo}."
+    elif tipo == "tecla":
+        nombre = normalizar(str(accion.get("tecla") or "")).replace(" ", "")
+        if nombre not in TECLAS_LLM:
+            return f"Tecla '{accion.get('tecla')}' no soportada. Usa: {sorted(set(TECLAS_LLM))}."
+    if tipo != "terminar":
+        clave = (fp, json.dumps({k: accion.get(k) for k in ("accion", "texto", "etiqueta", "valor", "tecla")},
+                                sort_keys=True, ensure_ascii=False))
+        if clave in est.hechas:
+            return ("Ya hiciste exactamente esa acción en esta misma pantalla y no avanzó. "
+                    "Haz otra cosa (otro control, otra ruta) o termina.")
+    return ""
+
+
+# ---------------------------------------------------------------- validar el final
+def validar_fallida(accion: dict, est: Estado) -> str:
+    if est.avisos_fallida >= 1:
+        return ""               # un solo aviso: si insiste con evidencia, se acepta
+    busco = any(p.ok and p.accion.get("accion") in ("escribir", "clic") for p in est.pasos)
+    if not busco:
+        est.avisos_fallida += 1
+        return ("Aún no has buscado nada en la app. Antes de concluir 'fallida', búscalo "
+                "(filtro, menú, otra pantalla) y decide con lo que veas.")
+    datos = [str(d) for d in (accion.get("datos_razon") or []) if str(d).strip()]
+    if not datos:
+        est.avisos_fallida += 1
+        return "Para 'fallida' nombra en datos_razon los datos concretos que lo explican (identificadores vistos)."
+    vistos = " \n ".join(est.textos_vistos)
+    def visto(d):
+        nd = normalizar(d)
+        dig = re.sub(r"\D", "", d)
+        return (nd and nd in vistos) or (len(dig) >= 4 and dig in re.sub(r"\D", "", vistos))
+    if not any(visto(d) for d in datos):
+        est.avisos_fallida += 1
+        return (f"Ninguno de los datos_razon {datos} aparece en las pantallas que viste. "
+                "Nombra los identificadores tal como se ven en la app.")
+    return ""
+
+
+def filas_con(est: "Estado", datos: list[str]) -> list[str]:
+    """Filas de pantalla vistas en la tarea que contienen alguno de los datos (para que el
+    resumen de un fallo traiga TODOS los identificadores del registro, no solo uno)."""
+    out = []
+    claves = []
+    for d in datos:     # "CL-0005 (NIT: 52345678)" -> cada identificador con dígitos por separado
+        claves += [t for t in re.findall(r"[\w\-./]+", normalizar(d)) if re.search(r"\d", t) and len(t) >= 4]
+    for c in claves:
+        for f in est.filas_vistas:
+            if re.search(r"(?<!\w)" + re.escape(c) + r"(?!\w)", normalizar(f)) and f not in out:
+                out.append(f)
+    return out[:6]
+
+
+def armar_resumen(accion: dict, estado: str, tipo_tarea: str, est: "Estado | None" = None) -> str:
+    resumen = str(accion.get("resumen") or "").strip()
+    lineas = [l for l in resumen.splitlines() if not normalizar(l).startswith("respuesta")]
+    resumen = "\n".join(lineas).strip()
+    if estado == "fallida":
+        datos = [str(d) for d in (accion.get("datos_razon") or []) if str(d).strip()]
+        faltan = [d for d in datos if d not in resumen]
+        if faltan:
+            resumen += ("\n" if resumen else "") + "Datos: " + ", ".join(faltan)
+        if est is not None:
+            vistas = filas_con(est, datos)
+            if vistas:
+                resumen += "\nRegistros vistos: " + " ; ".join(vistas)
+        return resumen
+    resp = accion.get("respuesta")
+    if resp not in (None, "", "null"):
+        resp = str(resp).strip()
+        resumen = f"respuesta: {resp}\n{resumen}".strip()
+    return resumen
+
+
+# ---------------------------------------------------------------- mensaje por paso
+def mensaje_paso(est: Estado, pantalla: str, pasos_restantes: int | None) -> str:
+    hoy = (f"{est.hoy.isoformat()} ({DIAS[est.hoy.weekday()]}, {est.hoy.strftime('%d/%m/%Y')})"
+           if est.hoy else "no se ve en pantalla (usa la que muestre la app)")
+    c = est.clasificacion
+    partes = [f"TAREA: {est.tarea}", f"HOY (fecha de la app): {hoy}"]
+    if c:
+        partes.append(f"CLASIFICACIÓN INICIAL (opinión, no decisión): {c.get('tipo')} — {c.get('motivo', '')}")
+    if est.clics_ok:
+        partes.append("CLICS QUE FUNCIONARON (en orden): " + " > ".join(est.clics_ok[-12:]))
+    if est.memoria:
+        partes.append(f"MEMORIA: {est.memoria}")
+    if est.pasos:
+        hist = []
+        for p in est.pasos[-HISTORIAL_VISIBLE:]:
+            a = {k: v for k, v in p.accion.items() if k in ("accion", "texto", "etiqueta", "valor", "tecla") and v}
+            hist.append(f"  {p.n}. {json.dumps(a, ensure_ascii=False)} -> {'ok' if p.ok else 'ERROR'}: {p.resultado[:300]}")
+        partes.append("ÚLTIMOS PASOS:\n" + "\n".join(hist))
+    if pasos_restantes is not None:
+        partes.append(f"TIEMPO: te quedan ~{pasos_restantes} pasos, termina (terminada si ya está hecho, "
+                      "o fallida explicando lo que falta).")
+    if est.aviso:
+        partes.append(f"AVISO DEL CÓDIGO: {est.aviso}")
+    partes.append("PANTALLA (OCR, filas de izquierda a derecha):\n" + pantalla)
+    return "\n\n".join(partes)
+
+
+def clasificar(est: Estado) -> dict:
+    obj, err = llamar_llm([{"role": "system", "content": PROMPT_CLASIFICAR},
+                           {"role": "user", "content": est.tarea}], est, timeout=12.0)
+    if not obj:
+        return {"tipo": "accion", "motivo": f"sin clasificación ({err})"}
+    return obj
+
+
+def guardar_traza(est: Estado, estado: str = "en_curso", resumen: str = "") -> None:
+    try:
+        DIR_TRAZAS.mkdir(exist_ok=True)
+        datos = {
+            "task_id": est.task_id, "tarea": est.tarea, "modelo": MODELO,
+            "hoy": est.hoy.isoformat() if est.hoy else None,
+            "clasificacion": est.clasificacion, "estado": estado, "resumen": resumen,
+            "pasos_total": len(est.pasos), "tiempo_total": round(time.time() - est.inicio, 2),
+            "tokens": est.tokens, "costo": round(est.costo, 6), "llamadas_llm": est.llamadas_llm,
+            "pasos": [{"n": p.n, "pantalla": p.pantalla, "accion": p.accion, "ok": p.ok,
+                       "resultado": p.resultado, "tokens": p.tokens, "costo": round(p.costo, 6),
+                       "t_llm": round(p.t_llm, 2), "t_accion": round(p.t_accion, 2),
+                       "t_total": round(p.t_total, 2)} for p in est.pasos],
+        }
+        texto = filtrar(json.dumps(datos, ensure_ascii=False, indent=1, default=str))
+        (DIR_TRAZAS / f"{est.task_id}.json").write_text(texto, encoding="utf-8")
+    except Exception:
+        pass        # la traza nunca tumba la tarea
+
+
+# ---------------------------------------------------------------- el loop
+def correr(vnc, tarea: str, deadline: float, task_id: str) -> tuple[str, str, Estado]:
+    est = Estado(tarea=tarea, deadline=deadline, task_id=task_id)
+    imagen, lineas, _ = observar(vnc)
+    est.hoy = fecha_hoy(lineas)                         # HOY se lee UNA vez al inicio...
+    est.clasificacion = clasificar(est)
+    tipo_tarea = str(est.clasificacion.get("tipo") or "accion")
+
+    def cerrar(estado: str, resumen: str):
+        guardar_traza(est, estado, resumen)
+        return estado, resumen, est
+
+    for n in range(1, MAX_PASOS + 1):
+        t_paso = time.time()
+        if est.restante() <= MARGEN_FINAL:
+            hechos = "; ".join(f"{p.accion.get('accion')} {p.accion.get('texto') or p.accion.get('etiqueta') or ''}".strip()
+                               for p in est.pasos if p.ok)[-400:]
+            return cerrar("fallida", f"Se acabó el tiempo antes de completar la tarea. Pasos hechos: {hechos or 'ninguno'}.")
+        fp = firma(lineas)
+        for ln in lineas:
+            est.textos_vistos.add(normalizar(ln.texto))
+        for f in filas(lineas):
+            t = " | ".join(l.texto for l in f)
+            if t not in est.filas_vistas:
+                est.filas_vistas.append(t)
+        pantalla, corto = pantalla_para_llm(imagen, lineas)
+
+        # Presupuesto: tiempo medio por paso (o estimación inicial) frente a lo que queda.
+        medio = (sum(p.t_total for p in est.pasos) / len(est.pasos)) if est.pasos else PASO_ESTIMADO_INICIAL
+        quedan = int((est.restante() - MARGEN_FINAL) // max(medio, 1.0))
+        aviso_pasos = quedan if quedan <= PASOS_AVISO else None
+        if n == MAX_PASOS - 2:
+            aviso_pasos = 2
+
+        t0 = time.time()
+        obj, err = llamar_llm([{"role": "system", "content": PROMPT_SISTEMA},
+                               {"role": "user", "content": mensaje_paso(est, pantalla, aviso_pasos)}], est)
+        t_llm = time.time() - t0
+        tok, cos = getattr(est, "_ultimo_uso", (0, 0.0))
+        est._ultimo_uso = (0, 0.0)
+        est.aviso = ""
+        if obj is None:
+            est.pasos.append(Paso(n, {"accion": "llm"}, f"paso fallido: {err}", False, corto, tok, cos,
+                                  t_llm, 0, time.time() - t_paso))
+            est.fallos_seguidos += 1
+            guardar_traza(est)
+            continue
+        if obj.get("memoria") not in (None, "", "null"):
+            est.memoria = str(obj["memoria"])[:800]
+        accion = {k: obj.get(k) for k in ("accion", "texto", "etiqueta", "valor", "tecla", "estado",
+                                          "resumen", "respuesta", "datos_razon", "razon")}
+        accion["accion"] = normalizar(str(accion.get("accion") or ""))
+
+        aviso = validar(accion, est, lineas, est.hoy, fp)
+        if not aviso and accion["accion"] == "terminar":
+            estado = normalizar(str(accion.get("estado") or ""))
+            if estado not in ("terminada", "fallida"):
+                aviso = "terminar necesita estado 'terminada' o 'fallida'."
+            elif estado == "fallida":
+                aviso = validar_fallida(accion, est)
+            else:
+                # ...y se RELEE antes de terminar, junto con la pantalla.
+                imagen2, lineas2, _ = observar(vnc)
+                hoy2 = fecha_hoy(lineas2)
+                if est.avisos_terminada < 1 and ((hoy2 and hoy2 != est.hoy) or firma(lineas2) != fp):
+                    est.avisos_terminada += 1
+                    if hoy2:
+                        est.hoy = hoy2
+                    imagen, lineas = imagen2, lineas2
+                    aviso = ("Releí la pantalla antes de terminar y cambió (o cambió HOY). "
+                             "Confirma con esta pantalla que el resultado está hecho.")
+            if not aviso:
+                resumen = filtrar(armar_resumen(accion, estado, tipo_tarea, est))
+                est.pasos.append(Paso(n, accion, f"terminar {estado}", True, corto, tok, cos, t_llm, 0,
+                                      time.time() - t_paso))
+                return cerrar(estado, resumen)
+
+        if aviso:
+            est.aviso = aviso
+            est.pasos.append(Paso(n, accion, f"rechazada por el código: {aviso}", False, corto, tok, cos,
+                                  t_llm, 0, time.time() - t_paso))
+            est.fallos_seguidos += 1
+            if est.fallos_seguidos >= 3:
+                est.aviso += " Llevas varios errores seguidos: replantea el camino."
+            guardar_traza(est)
+            continue
+
+        t1 = time.time()
+        try:
+            res = ejecutar(vnc, accion, imagen, lineas)
+        except Exception as e:
+            res = Resultado(False, f"excepción al ejecutar: {type(e).__name__}: {e}")
+        t_acc = time.time() - t1
+        est.hechas.add((fp, json.dumps({k: accion.get(k) for k in ("accion", "texto", "etiqueta", "valor", "tecla")},
+                                       sort_keys=True, ensure_ascii=False)))
+        est.pasos.append(Paso(n, accion, res.detalle, res.ok, corto, tok, cos, t_llm, t_acc, 0))
+        if res.ok:
+            est.fallos_seguidos = 0
+            if accion["accion"] == "clic":
+                est.clics_ok.append(accion["texto"])
+        else:
+            est.fallos_seguidos += 1
+            if est.fallos_seguidos >= 2:
+                # 2 fallos seguidos: Esc para cerrar lo que haya abierto y replantear.
+                vnc.pulsar("esc")
+                est.aviso = "Dos fallos seguidos: pulsé Esc. Replantea el camino con la pantalla actual."
+                est.fallos_seguidos = 0
+
+        # Nueva observación (la de la acción si la hizo con OCR; si no, se observa).
+        if res.lineas_despues is not None and res.captura_despues is not None and res.ok and not est.aviso:
+            imagen, lineas = res.captura_despues, res.lineas_despues
+        else:
+            imagen, lineas, _ = observar(vnc)
+        est.pasos[-1].t_total = time.time() - t_paso
+        guardar_traza(est)
+
+    return cerrar("fallida", "No terminé la tarea dentro del número máximo de pasos.")
